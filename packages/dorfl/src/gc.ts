@@ -1,6 +1,7 @@
 import {existsSync, lstatSync, readdirSync, rmSync, statSync} from 'node:fs';
 import {join} from 'node:path';
 import {git, run} from './git.js';
+import {encodeRepoKey, readOriginUrl} from './repo-mirror.js';
 import {
 	JOB_RECORD_FILENAME,
 	jobRecordPath,
@@ -252,6 +253,17 @@ export interface GcOptions {
 	/** The execution working area (config `workspacesDir`, default `~/.dorfl`). */
 	workspacesDir: string;
 	/**
+	 * SCOPE the sweep to a SINGLE arbiter: only worktrees whose hub mirror's
+	 * `origin` encodes to this hub key ({@link encodeRepoKey}) are considered.
+	 * This is the DEFAULT operating mode of the `gc` CLI (the arbiter resolved
+	 * from the cwd) — a `gc` run from repo A must NEVER touch repo B's worktrees.
+	 *
+	 * When UNSET the sweep is GLOBAL (every arbiter under `workspacesDir/work/*`).
+	 * Global is the destructive, cross-repo mode: the CLI only reaches it behind
+	 * the explicit + loud `--all-arbiters` flag, NEVER by defaulting here.
+	 */
+	arbiterKey?: string;
+	/**
 	 * Override the predicate for EVERY job: discard un-saved work. Loud +
 	 * explicit (the CLI guards it behind a confirmation) — NEVER the default.
 	 */
@@ -295,20 +307,42 @@ export interface GcResult {
  * `force: true` overrides the predicate for every job (discard un-saved work) —
  * loud + explicit (the CLI confirms first), NEVER the default. A job whose work
  * is NOT on the arbiter is never auto-removed without `force`.
+ *
+ * SCOPE: when `arbiterKey` is set the sweep considers ONLY worktrees belonging
+ * to that arbiter (the CLI's default, resolved from the cwd) — so a `gc` in repo
+ * A cannot reap repo B's worktrees. An UNSET `arbiterKey` sweeps GLOBALLY across
+ * every arbiter (the CLI reaches that only behind the loud `--all-arbiters`).
  */
 export function gc(options: GcOptions): GcResult {
 	const note = options.note ?? (() => {});
 	const env = options.env;
+	const arbiterKey = options.arbiterKey;
 	const reaped: ReapedJob[] = [];
 	const retained: RetainedJob[] = [];
 
 	// First, self-heal any record-less ORPHAN `work/*` entry (a dangling symlink
 	// or a dir git never registered) so a half-set-up claim does not linger unseen
-	// by the job loop below and wedge the next `worktree add`.
+	// by the job loop below and wedge the next `worktree add`. Orphans carry NO
+	// durable work and are NOT any repo's real worktree (no record ⇒ no mirror to
+	// attribute to an arbiter), so the arbiter scope does not gate them — they are
+	// bounded, worthless residue either way.
 	const sweptOrphans = sweepOrphans(options.workspacesDir, note);
 
 	for (const job of discoverJobs(options.workspacesDir)) {
 		const mirrorPath = resolveMirrorPath(options.workspacesDir, job);
+
+		// ARBITER SCOPE (the default `gc` mode): when `arbiterKey` is set, consider
+		// ONLY worktrees whose mirror `origin` encodes to that hub key — a `gc` run
+		// from repo A must never reap repo B's worktrees. A job whose mirror origin
+		// is unreadable (a malformed mirror) is SKIPPED under scope (the safe
+		// direction: we cannot prove it belongs to this arbiter, so leave it).
+		if (
+			arbiterKey !== undefined &&
+			jobArbiterKey(mirrorPath, env) !== arbiterKey
+		) {
+			continue;
+		}
+
 		const result = reapJob({
 			dir: job.dir,
 			branch: job.branch,
@@ -477,6 +511,79 @@ function resolveMirrorPath(workspacesDir: string, job: GcJob): string {
 	}
 	// Fallback: the repos hub under the workspaces dir (best-effort).
 	return join(workspacesDir, 'repos');
+}
+
+/**
+ * The hub KEY ({@link encodeRepoKey}) of the arbiter a job worktree belongs to,
+ * read from its hub mirror's `origin` URL (the arbiter URL the mirror was cloned
+ * from). This is the SAME identity `do --isolated` / `ensureMirror` key a repo's
+ * arbiter under (`mirrorPath` = `<workspacesDir>/repos/<key>.git`), so a `gc`
+ * scoped to the cwd's arbiter key matches exactly the worktrees cut for that
+ * arbiter. Returns `undefined` when the mirror `origin` cannot be read (a
+ * malformed mirror) — the caller then treats the job as NOT belonging to the
+ * scoped arbiter (the safe direction under a scoped sweep).
+ */
+function jobArbiterKey(
+	mirrorPath: string,
+	env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+	const originUrl = readOriginUrl(mirrorPath, env);
+	return originUrl === undefined ? undefined : encodeRepoKey(originUrl);
+}
+
+/** One distinct arbiter with worktrees under the work area (for the loud
+ * `--all-arbiters` banner). */
+export interface WorkspaceArbiter {
+	/** The hub key ({@link encodeRepoKey}) — or `undefined` for a malformed mirror. */
+	key?: string;
+	/** The arbiter `origin` URL of the hub mirror, when readable. */
+	url?: string;
+}
+
+/**
+ * Enumerate the DISTINCT arbiters that currently own a worktree under
+ * `<workspacesDir>/work/*` — i.e. the set a GLOBAL (`--all-arbiters`) sweep would
+ * touch. Reads each discovered job's hub mirror `origin` URL and de-duplicates
+ * by hub key. Used ONLY to print the loud banner before a cross-arbiter sweep;
+ * the sweep itself re-derives per-job scope in {@link gc}.
+ */
+export function enumerateWorkspaceArbiters(
+	workspacesDir: string,
+	env: NodeJS.ProcessEnv | undefined,
+): WorkspaceArbiter[] {
+	const seen = new Map<string, WorkspaceArbiter>();
+	for (const job of discoverJobs(workspacesDir)) {
+		const mirrorPath = resolveMirrorPath(workspacesDir, job);
+		const url = readOriginUrl(mirrorPath, env);
+		const key = url === undefined ? undefined : encodeRepoKey(url);
+		const dedupe = key ?? `path:${mirrorPath}`;
+		if (!seen.has(dedupe)) {
+			seen.set(dedupe, {key, url});
+		}
+	}
+	return [...seen.values()];
+}
+
+/**
+ * The hub KEY ({@link encodeRepoKey}) of the arbiter reachable from a working
+ * repo `cwd` via its `<arbiter>` remote (default `origin`), i.e. `encodeRepoKey`
+ * of `git -C <cwd> remote get-url <arbiter>`. This is how the `gc` CLI resolves
+ * the DEFAULT scope from the current directory — the SAME arbiter-resolution the
+ * mirror / `do --isolated` path uses (`ensureMirror`'s `fromRepo` + `arbiter`).
+ * Returns `undefined` when `cwd` is not a git repo or has no such remote (the
+ * CLI then errors rather than silently going global).
+ */
+export function resolveArbiterKeyFromCwd(
+	cwd: string,
+	arbiter: string,
+	env: NodeJS.ProcessEnv | undefined,
+): string | undefined {
+	const res = run('git', ['remote', 'get-url', arbiter], cwd, {env});
+	if (res.status !== 0) {
+		return undefined;
+	}
+	const url = res.stdout.trim();
+	return url === '' ? undefined : encodeRepoKey(url);
 }
 
 /**

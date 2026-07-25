@@ -15,7 +15,15 @@ import {
 	jobWorktreePath,
 	type Job,
 } from '../src/workspace.js';
-import {evaluateDeletionSafety, reapJob, gc, discoverJobs} from '../src/gc.js';
+import {
+	evaluateDeletionSafety,
+	reapJob,
+	gc,
+	discoverJobs,
+	resolveArbiterKeyFromCwd,
+	enumerateWorkspaceArbiters,
+} from '../src/gc.js';
+import {encodeRepoKey} from '../src/repo-mirror.js';
 import {
 	makeScratch,
 	seedRepoWithArbiter,
@@ -435,6 +443,116 @@ describe('gc — re-apply the predicate across work/*', () => {
 		const second = gc({workspacesDir, env: gitEnv()});
 		expect(second.reaped).toHaveLength(0);
 		expect(second.retained).toHaveLength(0);
+	});
+});
+
+describe('gc — ARBITER SCOPE (a gc for repo A must not touch repo B)', () => {
+	/**
+	 * The incident this scope closes: a `gc` (especially `--force --yes`) run to
+	 * reap ONE arbiter's stale worktree used to sweep GLOBALLY and could
+	 * irreversibly discard an UNRELATED arbiter's un-pushed work. Scoped to the
+	 * cwd's arbiter key, a sweep now only considers that arbiter's worktrees.
+	 */
+	it('DEFAULT (arbiterKey set): reaps ONLY the scoped arbiter, leaving the other arbiter untouched', () => {
+		// Two jobs under DISTINCT arbiters, one shared workspacesDir. Job A is
+		// un-merged (would be reaped by --force); job B holds un-pushed work.
+		const a = setupJob('repo-a');
+		const b = setupJob('repo-b');
+		const workspacesDir = a.workspacesDir;
+		commitWork(a.job);
+		commitWork(b.job); // un-pushed work in repo B — must NEVER be discarded by A's gc
+
+		const arbiterKeyA = encodeRepoKey(a.job.mirror.url);
+
+		// A FORCED, arbiter-A-scoped sweep: reaps A, but B is out of scope entirely.
+		const result = gc({
+			workspacesDir,
+			arbiterKey: arbiterKeyA,
+			force: true,
+			env: gitEnv(),
+		});
+
+		const touched = [
+			...result.reaped.map((j) => j.slug),
+			...result.retained.map((j) => j.slug),
+		];
+		expect(touched).toEqual(['repo-a']);
+		expect(result.reaped.map((j) => j.slug)).toEqual(['repo-a']);
+		expect(existsSync(a.job.dir)).toBe(false); // A reaped
+		expect(existsSync(b.job.dir)).toBe(true); // B's un-pushed work UNTOUCHED
+	});
+
+	it('GLOBAL (arbiterKey unset): the old cross-arbiter behaviour still reaps every arbiter', () => {
+		const a = setupJob('repo-a');
+		const b = setupJob('repo-b');
+		const workspacesDir = a.workspacesDir;
+		commitWork(a.job);
+		commitWork(b.job);
+
+		const result = gc({workspacesDir, force: true, env: gitEnv()});
+		const reaped = result.reaped.map((j) => j.slug).sort();
+		expect(reaped).toEqual(['repo-a', 'repo-b']);
+		expect(existsSync(a.job.dir)).toBe(false);
+		expect(existsSync(b.job.dir)).toBe(false);
+	});
+
+	it('a non-matching arbiterKey reaps NOTHING (no arbiter\u2019s worktrees in scope)', () => {
+		const a = setupJob('repo-a');
+		const b = setupJob('repo-b');
+		const workspacesDir = a.workspacesDir;
+		commitWork(a.job);
+		commitWork(b.job);
+
+		const result = gc({
+			workspacesDir,
+			arbiterKey: 'no-such-host/nobody/nothing',
+			force: true,
+			env: gitEnv(),
+		});
+		expect(result.reaped).toHaveLength(0);
+		expect(result.retained).toHaveLength(0);
+		expect(existsSync(a.job.dir)).toBe(true);
+		expect(existsSync(b.job.dir)).toBe(true);
+	});
+
+	it('enumerateWorkspaceArbiters lists each distinct arbiter (for the loud --all-arbiters banner)', () => {
+		const a = setupJob('repo-a');
+		setupJob('repo-b');
+		const workspacesDir = a.workspacesDir;
+
+		const arbiters = enumerateWorkspaceArbiters(workspacesDir, gitEnv());
+		const keys = arbiters.map((x) => x.key).sort();
+		expect(keys).toHaveLength(2);
+		// Distinct keys, both readable (no malformed mirrors).
+		expect(keys.every((k) => typeof k === 'string')).toBe(true);
+	});
+});
+
+describe('resolveArbiterKeyFromCwd — the cwd\u2192arbiter resolution the CLI scopes on', () => {
+	it('resolves a repo\u2019s remote to the SAME key its worktrees are keyed under', () => {
+		const {job, url} = setupJob('feat');
+		// The repo the operator runs `gc` from: give it an `origin` remote pointing
+		// at the SAME arbiter URL the mirror was cut from.
+		const repo = join(scratch.root, 'operator-checkout');
+		git(['init', '-q', '-b', 'main', repo], scratch.root, {env: gitEnv()});
+		git(['remote', 'add', 'origin', url], repo, {env: gitEnv()});
+
+		const key = resolveArbiterKeyFromCwd(repo, 'origin', gitEnv());
+		expect(key).toBe(encodeRepoKey(job.mirror.url));
+	});
+
+	it('returns undefined when there is no such remote (the CLI then errors, never goes global)', () => {
+		const repo = join(scratch.root, 'no-remote');
+		git(['init', '-q', '-b', 'main', repo], scratch.root, {env: gitEnv()});
+		expect(resolveArbiterKeyFromCwd(repo, 'origin', gitEnv())).toBeUndefined();
+	});
+
+	it('returns undefined when cwd is not a git repo at all', () => {
+		const notRepo = join(scratch.root, 'plain-dir');
+		mkdirSync(notRepo, {recursive: true});
+		expect(
+			resolveArbiterKeyFromCwd(notRepo, 'origin', gitEnv()),
+		).toBeUndefined();
 	});
 });
 

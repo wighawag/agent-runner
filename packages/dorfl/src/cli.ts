@@ -108,7 +108,12 @@ import {harnessTaskReviewGate} from './tasker-review-loop.js';
 import {runVerify} from './verify.js';
 import {renderPrompt} from './prompt.js';
 import {resolvePromptGuidance} from './config.js';
-import {gc, RETAIN_REASON_TEXT} from './gc.js';
+import {
+	gc,
+	resolveArbiterKeyFromCwd,
+	enumerateWorkspaceArbiters,
+	RETAIN_REASON_TEXT,
+} from './gc.js';
 import {
 	runPrdToSpec,
 	type PrdToSpecResult,
@@ -822,6 +827,7 @@ interface GcFlags {
 	ledger?: string;
 	remoteBranches?: boolean;
 	arbiter?: string;
+	allArbiters?: boolean;
 	cwd?: string;
 	dryRun?: boolean;
 	reapStaleLocks?: boolean;
@@ -3391,7 +3397,7 @@ export function buildProgram(): Command {
 		.command('gc')
 		.helpGroup(ADVANCED_GROUP)
 		.description(
-			'Re-apply the provably-safe deletion predicate (ADR \u00a74) across every job worktree under workspacesDir/work/*: reap the provably-safe ones (clean tree AND branch tip reachable on the arbiter \u2014 merged or pushed) via git worktree remove (+ prune, never rm -rf), and report each RETAINED one with a reason. The catch-up for when end-of-job auto-reap did not run (runner crash/kill). --force overrides the predicate (discards un-saved work) \u2014 loud, never default.',
+			'Re-apply the provably-safe deletion predicate (ADR \u00a74) to job worktrees under workspacesDir/work/*: reap the provably-safe ones (clean tree AND branch tip reachable on the arbiter \u2014 merged or pushed) via git worktree remove (+ prune, never rm -rf), and report each RETAINED one with a reason. The catch-up for when end-of-job auto-reap did not run (runner crash/kill). SCOPE: by DEFAULT this is ARBITER-SCOPED \u2014 it acts ONLY on worktrees belonging to the arbiter resolved from the cwd (the same arbiter do --isolated/the mirror uses), so a gc in repo A can never reap repo B\u2019s worktrees. Pass --all-arbiters to sweep across EVERY arbiter (loud + global), or --arbiter <remote-or-url> to target a specific one. --force overrides the predicate (discards un-saved work) and requires --yes \u2014 loud, never default; --all-arbiters --force must be opted into explicitly, never reached by default.',
 		)
 		.option('-c, --config <path>', 'config file path', defaultConfigPath())
 		.option(
@@ -3416,8 +3422,12 @@ export function buildProgram(): Command {
 			'SWEEP the arbiter’s remote work/* BRANCHES instead of job worktrees: delete (via git push --delete, NEVER --force) exactly those PROVABLY MERGED into <arbiter>/main (git merge-base --is-ancestor, the SAME predicate the worktree reaper uses), and RETAIN the rest with a reason. An in-flight/un-merged branch (the recovery point) is NEVER touched. Provider-agnostic plain git — works on a --bare arbiter. The merged-only complement of `requeue --reset`.',
 		)
 		.option(
-			'--arbiter <remote>',
-			'(with --remote-branches) the arbiter git remote whose work/* branches to sweep (default: origin); resolved from --cwd',
+			'--arbiter <remote-or-url>',
+			'SCOPE the worktree sweep to a SPECIFIC arbiter (a remote NAME resolved from --cwd, or a direct arbiter URL) instead of the cwd\u2019s. (With --remote-branches / --ledger it names the arbiter git remote whose work/* branches / locks to sweep; default there: origin.)',
+		)
+		.option(
+			'--all-arbiters',
+			'GLOBAL, LOUD override: sweep worktrees across EVERY arbiter under workspacesDir/work/* (today\u2019s pre-scoping behaviour), not just the cwd\u2019s. Prints a banner naming every arbiter it will act on before doing anything; combining it with --force still requires --yes. This is the destructive cross-repo path \u2014 opt into it explicitly.',
 		)
 		.option(
 			'--cwd <dir>',
@@ -3614,6 +3624,77 @@ export function buildProgram(): Command {
 				return;
 			}
 
+			// SCOPE RESOLUTION (this task): the worktree reaper is ARBITER-SCOPED by
+			// default. `--all-arbiters` restores the GLOBAL (cross-arbiter) sweep behind
+			// a LOUD banner; `--arbiter <remote-or-url>` targets a specific arbiter; the
+			// bare default resolves the arbiter from the cwd (the SAME resolution
+			// `do --isolated` / the mirror uses). With NO resolvable cwd arbiter and
+			// neither flag, we REFUSE (never silently fall back to global) — gc used to
+			// default to global, and a global `gc --force --yes` from repo A could
+			// irreversibly discard repo B's un-pushed work.
+			let arbiterKey: string | undefined;
+			if (flags.allArbiters !== true) {
+				if (flags.arbiter !== undefined && flags.arbiter.trim() !== '') {
+					// An explicit arbiter: a direct URL (contains `://`, a scp-like `:`,
+					// or an absolute path) is keyed directly; otherwise it is a remote NAME
+					// resolved from the cwd (default `origin`).
+					const spec = flags.arbiter.trim();
+					const looksLikeUrl =
+						spec.includes('://') ||
+						spec.startsWith('/') ||
+						/^[^/]+@/.test(spec);
+					// A remote NAME resolves from --cwd if given (consistent with the
+					// other gc sub-modes), else the process cwd.
+					const resolveFrom = flags.cwd ?? process.cwd();
+					arbiterKey = looksLikeUrl
+						? encodeRepoKey(spec)
+						: resolveArbiterKeyFromCwd(resolveFrom, spec, process.env);
+					if (arbiterKey === undefined) {
+						console.error(
+							`refusing: could not resolve arbiter '${spec}' \u2014 not a URL and ` +
+								'no git remote with that name in the cwd. Pass a remote name that ' +
+								'exists here, an arbiter URL, or --all-arbiters.',
+						);
+						process.exit(1);
+					}
+				} else {
+					arbiterKey = resolveArbiterKeyFromCwd(
+						flags.cwd ?? process.cwd(),
+						config.defaultArbiter,
+						process.env,
+					);
+					if (arbiterKey === undefined) {
+						console.error(
+							'refusing: `gc` is now ARBITER-SCOPED and could not resolve an ' +
+								`arbiter from the current directory (no '${config.defaultArbiter}' ` +
+								'git remote, or not inside a repo). It will NOT fall back to a ' +
+								'global cross-arbiter sweep. Run it from a repo with an arbiter ' +
+								'remote, pass --arbiter <remote-or-url>, or --all-arbiters to sweep ' +
+								'every arbiter.',
+						);
+						process.exit(1);
+					}
+				}
+			} else {
+				// GLOBAL sweep: LOUD banner naming EVERY arbiter it will act on before
+				// doing anything (this task's "loud" requirement). Global + --force must be
+				// opted into explicitly (the --yes gate below still applies), never reached
+				// by default.
+				const arbiters = enumerateWorkspaceArbiters(workspacesDir, process.env);
+				console.error(
+					'>> --all-arbiters: operating GLOBALLY across ALL arbiters under ' +
+						`${workspacesDir}/work/* (NOT scoped to the current repo).`,
+				);
+				if (arbiters.length > 0) {
+					console.error('>> arbiters in scope:');
+					for (const a of arbiters) {
+						console.error(`>>   - ${a.url ?? a.key ?? '(malformed mirror)'}`);
+					}
+				} else {
+					console.error('>> (no worktrees found under any arbiter)');
+				}
+			}
+
 			// `--force` discards un-saved work, so it is gated behind an explicit
 			// confirmation (`--yes`) — loud + intentional, NEVER the default (ADR §4).
 			if (flags.force && !flags.yes) {
@@ -3633,6 +3714,7 @@ export function buildProgram(): Command {
 
 			const result = gc({
 				workspacesDir,
+				arbiterKey,
 				force: flags.force === true,
 				note: (message) => console.error(`>> ${message}`),
 			});

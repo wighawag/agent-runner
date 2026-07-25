@@ -56,7 +56,7 @@ Consequences:
 - The trigger is **provable safety, not "success."** A successful-but-unpushed job is retained; a job whose commits are on the arbiter is reaped. One rule, no done-vs-failed special-casing.
 - `propose` mode (§6) is delete-eligible because opening a review request implies the branch was **pushed** — but we verify _remote tip == local tip_, not merely "a review request exists" (guards a later un-pushed amend).
 - The only worktrees that linger are **genuinely un-saved work** (failures, crashes, dirty trees) — a reliable "needs attention" signal that dovetails with `watch`'s surface-failures rail.
-- **`gc`** re-applies the same predicate as a safety net (for when auto-delete didn't run — runner crash/kill). `gc --force` overrides (loud, never default).
+- **`gc`** re-applies the same predicate as a safety net (for when auto-delete didn't run — runner crash/kill). It is **arbiter-scoped by default**: a bare `gc` acts ONLY on the worktrees of the arbiter resolved from the cwd (the same arbiter-resolution `do --isolated`/the mirror uses), so a `gc` in repo A can never reap repo B's worktrees. `--all-arbiters` restores the global cross-arbiter sweep behind a loud banner (naming every arbiter it will touch); `--arbiter <remote-or-url>` targets a specific one; with no resolvable cwd arbiter and neither flag, `gc` REFUSES rather than silently going global. `gc --force` overrides the deletion predicate (requires `--yes`; loud, never default) — and even then the destructive cross-arbiter combination (`--all-arbiters --force --yes`) must be opted into explicitly.
 - Removal is `git worktree remove` (+ prune), never a bare `rm -rf` (which would leave a dangling worktree registration on the hub).
 
 ## 5. Harness seam (liveness + invocation)

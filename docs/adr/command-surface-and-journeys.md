@@ -124,7 +124,7 @@ Two sub-modes, by where the work happens:
 - **`scan`** — cross-repo backlog queue. **Fetches the truth** (the remote is the source of truth in the registry model); on a failed fetch it falls back to last-known and **warns**. (This DROPS the old "scan is always offline" invariant — that was the roots-local model; superseded here.)
 - **`status`** — operational dashboard (running/stuck/cleanup). Fetches. Folds in the old `arbiter status`.
 - **`requeue <slug>`** (renamed from `return`) — move `needs-attention/ → backlog/` to retry later. The **defer-don't-finish** verb; its pair is `complete` (fixed it → finish) vs `requeue` (giving up/deferring → back to the queue).
-- **`gc`** — reap job WORKTREES via the provable predicate (never mirrors). `--force` (requires `--yes`) discards un-saved work — the one genuinely destructive `--force` in the CLI.
+- **`gc`** — reap job WORKTREES via the provable predicate (never mirrors). **Arbiter-scoped by default**: acts only on the arbiter resolved from the cwd, so a `gc` in repo A cannot reap repo B's worktrees; `--all-arbiters` (loud banner) restores the global sweep, `--arbiter <remote-or-url>` targets a specific one, and no-resolvable-arbiter-without-a-flag REFUSES rather than going global. `--force` (requires `--yes`) discards un-saved work — the one genuinely destructive `--force` in the CLI.
 - **`verify`** — run the per-repo acceptance gate standalone.
 
 ## 6. Mirror freshness (settled)
