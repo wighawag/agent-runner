@@ -219,7 +219,24 @@ Builds run `--isolated` on the arbiter, NOT your checkout, so a `git fetch` agai
 
 ### 5. CONTINUE until nothing can advance
 
-Repeat step 4 until no ready task can advance (the READY set is empty OR every remaining ready task is parked in the stuck-set). THEN deal with the stuck-set ([the rule](#the-accumulate-dont-block-rule)): if a human is present, ask the batched questions and resume the loop from the answers; if not, report the stuck-set and stop.
+Repeat step 4 until no ready task can advance (the READY set is empty OR every remaining ready task is parked in the stuck-set). THEN deal with the stuck-set ([the rule](#the-accumulate-dont-block-rule)): if a human is present, ask the batched questions and resume the loop from the answers; if not, report the stuck-set and stop. Once the loop is genuinely exhausted, run the end-of-drive triage (step 5.5) over the accumulated nits + observations BEFORE writing the report — any question it raises joins the same batch.
+
+### 5.5. TRIAGE the drive's accumulated nits + observations
+
+Step 4b triaged each task's nits **in isolation, at the moment its PR merged** — that is the right per-task gate, but it is deliberately narrow (does THIS nit block THIS PR?). It cannot see the drive as a whole. Across a multi-task drive, the nits (`work/notes/observations/review-nits-<slug>-*.md`, one set per built task) and the ad-hoc **off-path observations** you filed along the way (golden rules 3 + 5) pile up into a **residue that only makes sense read TOGETHER at the end** — a recurring nit the same shape across three PRs, a benign-in-isolation observation that is actually a real drift once you see its siblings, a cluster that adds up to a follow-up task. So before you write the report, do ONE cross-drive triage pass over the whole residue. Do it EVEN when the loop finished clean (no stuck-set): a green drive still leaves nits + observations that must be routed, not left to rot in `work/notes/observations/`.
+
+Collect the residue, then triage each item to exactly one destination:
+
+- **Gather** every `work/notes/observations/review-nits-<slug>-*.md` from the tasks you built this drive, plus every `work/notes/observations/*` note you filed during the drive (rule 3/5). Read them together, grouping by theme, not by task — a nit that recurs across PRs is the signal.
+- **Route each item** to ONE of:
+  - **Already-handled** — the nit was addressed in the merged diff (you fixed it at Gate-3, or the task did). Note it as closed; nothing to carry forward.
+  - **Benign / noise** — a style preference or a false positive that is genuinely fine. Say so explicitly (so it is a decision, not an omission) and let the note rest.
+  - **A real off-path finding worth its own `work/notes/observations/` note** — keep it, and COMMIT + PUSH it per rule 5 so it survives the drive and a later build can see it.
+  - **A follow-up TASK** — a nit/observation that is actually work (a recurring defect, a cross-cutting cleanup a whole cluster points at). Do NOT author the task yourself (that is `to-task`/human work — golden rule 5); instead record it in the triage output as a task-worthy item with a one-line rationale, for the human (or `orchestrate`) to task.
+  - **A stuck-set question** — a nit/observation whose disposition needs a human judgement call (blocking-or-not is a genuine coin-flip, or it implies a decision). Fold it into the same batched-questions surface as the loop's stuck-set (do not open a second, separate question channel).
+- **Do not fix-in-place off-path here either** (golden rule 3 still holds): triage routes each item to a destination, it does not expand scope or start editing merged code. The only writes this step makes are the append-only `work/notes/observations/` note commits (rule 5) and the triage outcome fed into the report.
+
+The outcome of this pass — what was closed, what was kept as an observation, what is task-worthy, what became a question — is a named section of the report (step 6). When a human is present and this pass raised questions, they join the stuck-set's [batched questions](#batching-the-questions); when unattended, the triage outcome is part of your reported result.
 
 ### 6. SUMMARISE — the conductor's report
 
@@ -230,6 +247,7 @@ End with a structured rundown (this is a first-class deliverable, not an afterth
 - **Still blocked / gated** — what remains and on what (a needs-attention item? a `needsAnswers` human gate?).
 - **What's now UNLOCKED in the project** — new commands, new behaviours/capabilities, retired verbs, and crucially **which specs are now taskable / unblocked** by what landed (the cross-cutting view only the conductor has).
 - **Observations filed** (committed as you go, per rule 5) — list them so the human can find them in `git log`.
+- **Nit + observation triage** (from step 5.5) — the cross-drive disposition of every `review-nits-<slug>-*` set and every off-path observation filed this drive, grouped by theme: what was **already handled** (closed in the merged diff), what is **benign/noise** (an explicit decision, not an omission), what was **kept as an observation** (committed + pushed), what is **task-worthy** (recorded for `to-task`/the human to task, NOT authored here), and what became a **stuck-set question** (folded into the batch). A recurring nit across PRs is called out as a cluster, not repeated per task.
 - **Housekeeping** — any direct-to-`main` chore commits you made (claim reverts, forward-notes), so the human can see them in `git log`.
 
 When you run unattended (no human reachable), this report (plus the stuck-set) is your RESULT to whoever invoked you, not a message to a human.
@@ -238,7 +256,7 @@ When you run unattended (no human reachable), this report (plus the stuck-set) i
 
 When the loop stalls with a non-empty stuck-set, do NOT ask one question at a time. **Regroup the stuck-set into a single, well-organised batch** (the way a good conductor surfaces everything at once for one efficient answering pass):
 
-- Group by item, each with: the task, the SPECIFIC question, why it's stuck (stale premise / uncertain forward-note / review judgement call), enough inline context to answer WITHOUT opening the file, and a **suggested default** where you have one.
+- Group by item, each with: the task, the SPECIFIC question, why it's stuck (stale premise / uncertain forward-note / review judgement call / an end-of-drive nit-or-observation whose disposition is a genuine coin-flip — step 5.5), enough inline context to answer WITHOUT opening the file, and a **suggested default** where you have one.
 - Order by leverage (a question whose answer unblocks the most downstream work first).
 - If a human is present: present the batch, take answers, resume the loop (resolved → buildable again; deferred → stays parked). If not: this batch is the residue you report and stop on.
 
