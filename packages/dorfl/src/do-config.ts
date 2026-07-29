@@ -260,7 +260,9 @@ export interface TriageModelFlags {
  * contributes when the flag is actually present (absent flag => absent key), so
  * the override layer never clobbers a lower-precedence source with `undefined`.
  */
-export function triageModelFlagOverrides(flags: TriageModelFlags): PartialConfig {
+export function triageModelFlagOverrides(
+	flags: TriageModelFlags,
+): PartialConfig {
 	const overrides: PartialConfig = {};
 	if (flags.triageModel !== undefined) {
 		overrides.triageModel = flags.triageModel;

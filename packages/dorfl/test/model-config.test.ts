@@ -9,7 +9,11 @@ import {
 } from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {DEFAULT_CONFIG, mergeConfig, applyModelFallbacks} from '../src/config.js';
+import {
+	DEFAULT_CONFIG,
+	mergeConfig,
+	applyModelFallbacks,
+} from '../src/config.js';
 import {envOverrides, envVarName} from '../src/env-config.js';
 import {
 	REPO_ALLOWED_KEYS,
