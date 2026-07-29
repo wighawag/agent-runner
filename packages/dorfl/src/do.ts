@@ -549,7 +549,9 @@ export interface DoOptions {
 	watch?: boolean;
 	/** The configured agent command the harness shells out to (null adapter). */
 	agentCmd?: string;
-	/** The model routing intent forwarded to the harness (ADR §13). */
+	/** The model routing intent forwarded to the harness (ADR §13). Sourced
+	 * from `config.buildModel` (which inherits the general `config.model` when
+	 * unset via `applyModelFallbacks`). */
 	model?: string;
 	/**
 	 * The HOST-ONLY root folder under which this run's pi session FILE is generated

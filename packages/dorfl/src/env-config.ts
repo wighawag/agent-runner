@@ -152,6 +152,9 @@ const KEY_COERCIONS: {[K in keyof Config]?: Coercion} = {
 	// A non-string / empty value is normalised at load (`validateDorflCmdConfig`).
 	dorflCmd: 'string',
 	model: 'string',
+	buildModel: 'string',
+	triageModel: 'string',
+	intakeModel: 'string',
 	harness: {enum: ['null', 'pi']},
 	piBin: 'string',
 	sessionsDir: 'string',

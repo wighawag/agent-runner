@@ -2,6 +2,7 @@ import {readFileSync, existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {
 	mergeConfig,
+	applyModelFallbacks,
 	validateDeadlineConfig,
 	validateDorflCmdConfig,
 	warnDeprecatedConfigKeys,
@@ -209,8 +210,12 @@ export const REPO_ALLOWED_KEYS = [
 	// `model` (which model this repo's work runs on) and `harness` (which adapter)
 	// are legitimate repo properties (ADR §13) — model is routing intent, not auth,
 	// and a repo may prefer a given harness. `piBin`/`agentCmd` stay host-only
-	// (machine paths/commands), so they are rejected below.
+	// (machine paths/commands), so they are rejected below. `buildModel` is the
+	// builder-specific override of the general `model` (falls back to `model` when
+	// unset at all levels — see `applyModelFallbacks`); like `model` it is routing
+	// intent (not auth), so it is repo-appropriate.
 	'model',
+	'buildModel',
 	'harness',
 	// Gate 2 (PR/code review) policy is a genuine repo property (GATES spec
 	// `work/specs/tasked/review.md`), resolved per-repo like `integration`/`autoBuild`:
@@ -230,6 +235,14 @@ export const REPO_ALLOWED_KEYS = [
 	'taskerLoop',
 	'taskerLoopMax',
 	'taskerLoopModel',
+	// `triageModel` (the model the advance lifecycle gates — surface, apply,
+	// triage — run on) is a genuine repo property like `reviewModel`/
+	// `taskerLoopModel`: routing intent (not auth), resolved per-repo through the
+	// same chain. `intakeModel` (the front-door intake decision agent's model) is
+	// likewise repo-appropriate. Each falls back to `model` when unset at all
+	// levels (see `applyModelFallbacks`).
+	'triageModel',
+	'intakeModel',
 	// `freshWorktreeGate` (run the acceptance gate against the REBASED tip in a
 	// clean throwaway worktree, ON by default) is a genuine repo property exactly
 	// like `verify`/`prepare`/`review`: whether this repo's gate tests the merged
@@ -646,6 +659,11 @@ export function resolveRepoConfigFromLoaded(
 	// (flag / env / per-repo / global) surfaces the same clear error (ADR
 	// `dorfl-cmd-repo-settable-exception-to-host-only`).
 	validateDorflCmdConfig(config);
+	// Apply the per-role model fallbacks: `buildModel`, `reviewModel`, and
+	// `taskerLoopModel` each inherit the general `model` when unset at EVERY level
+	// (flag / env / per-repo / global). Applied HERE — the resolution FINAL point —
+	// so the fallback uses the FULLY resolved `model`, never an intermediate layer.
+	applyModelFallbacks(config);
 	return {
 		config,
 		rejected: repo.rejected,

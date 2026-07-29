@@ -99,6 +99,7 @@ import {
 	freshWorktreeGateFlagOverrides,
 	mergeRetriesFlagOverrides,
 	noPRFlagOverrides,
+	triageModelFlagOverrides,
 } from './do-config.js';
 import {harnessReviewGate, harnessTaskAcceptanceGate} from './review-gate.js';
 import {harnessSurfaceGate} from './surface-gate.js';
@@ -107,7 +108,7 @@ import {harnessApplyDecider} from './apply-decide.js';
 import {harnessTaskReviewGate} from './tasker-review-loop.js';
 import {runVerify} from './verify.js';
 import {renderPrompt} from './prompt.js';
-import {resolvePromptGuidance} from './config.js';
+import {resolvePromptGuidance, applyModelFallbacks} from './config.js';
 import {
 	gc,
 	resolveArbiterKeyFromCwd,
@@ -216,7 +217,9 @@ function resolveGlobalConfig(
 	fileConfig: PartialConfig,
 	flags: PartialConfig,
 ): Config {
-	return mergeConfig({...fileConfig, ...envOverrides(), ...flags});
+	const config = mergeConfig({...fileConfig, ...envOverrides(), ...flags});
+	applyModelFallbacks(config);
+	return config;
 }
 
 /**
@@ -423,7 +426,7 @@ function buildRegistrySetAdvanceTick(options: {
 				noPR: config.noPR,
 				harness,
 				agentCmd: config.agentCmd,
-				model: config.model,
+				model: config.buildModel,
 				sessionsDir: config.sessionsDir,
 				review: config.review,
 				reviewModel: config.reviewModel,
@@ -448,12 +451,12 @@ function buildRegistrySetAdvanceTick(options: {
 				arbiter: arbiter ?? config.defaultArbiter,
 				doOptions,
 				surfaceGate: harnessSurfaceGate({harness, agentCmd: config.agentCmd}),
-				surfaceModel: config.model,
+				surfaceModel: config.triageModel,
 				applyDecide: harnessApplyDecider({harness, agentCmd: config.agentCmd}),
-				applyModel: config.model,
+				applyModel: config.triageModel,
 				observationTriage: config.observationTriage,
 				triageGate: harnessTriageGate({harness, agentCmd: config.agentCmd}),
-				triageModel: config.model,
+				triageModel: config.triageModel,
 				// The ANSWERED-MERGE LAND DISPATCH context (task
 				// `apply-rung-merge-disposition`, spec `land-time-reverify-and-parallel-
 				// merge-ceiling`): the dispatcher cuts a per-job worktree via
@@ -551,6 +554,8 @@ interface RunFlags extends ScanFlags {
 	pr?: boolean;
 	agentCmd?: string;
 	model?: string;
+	/** `--build-model <id>` — the builder-specific model override (falls back to `--model`). */
+	buildModel?: string;
 	harness?: string;
 	piBin?: string;
 	sessionsDir?: string;
@@ -558,6 +563,8 @@ interface RunFlags extends ScanFlags {
 	review?: boolean;
 	reviewModel?: string;
 	reviewMaxRounds?: string;
+	/** `--triage-model <id>` — the advance lifecycle gates' model (surface, apply, triage). */
+	triageModel?: string;
 	/** `--fresh-worktree-gate` / `--no-fresh-worktree-gate` — gate the REBASED tip in a clean throwaway worktree (ON by default). */
 	freshWorktreeGate?: boolean;
 	/** `--merge-retries <n>` — the cross-job merge-serialiser CAS-retry cap (spec `land-time-reverify-and-parallel-merge-ceiling` Story 5 / Applied Answer q1 (a)). */
@@ -593,6 +600,8 @@ function runFlagOverrides(flags: RunFlags, command?: Commander): PartialConfig {
 	// flag > env > per-repo > global > default — mirroring the `do` command (the
 	// fleet inherits the review gate via the converged `performIntegration` core).
 	Object.assign(overrides, reviewFlagOverrides(flags));
+	// `--triage-model` (the advance lifecycle gates' model) rides the SAME chain.
+	Object.assign(overrides, triageModelFlagOverrides(flags));
 	// `--fresh-worktree-gate`/`--no-fresh-worktree-gate` rides the SAME chain: gate
 	// the REBASED tip in a clean throwaway worktree (ON by default). The `run` fleet
 	// caller additionally downgrades it to today's gate at `perRepoMax > 1` (the
@@ -769,6 +778,8 @@ interface DoFlags {
 	allowBacklog?: boolean;
 	agentCmd?: string;
 	model?: string;
+	/** `--build-model <id>` — the builder-specific model override (falls back to `--model`). */
+	buildModel?: string;
 	harness?: string;
 	piBin?: string;
 	sessionsDir?: string;
@@ -776,6 +787,8 @@ interface DoFlags {
 	review?: boolean;
 	reviewModel?: string;
 	reviewMaxRounds?: string;
+	/** `--triage-model <id>` — the advance lifecycle gates' model (surface, apply, triage). */
+	triageModel?: string;
 	/** `--tasker-loop` / `--no-tasker-loop` — the tasker improver loop on/off toggle (`do spec:` path). Resolves into the `taskerLoop` config key. */
 	taskerLoop?: boolean;
 	/** `--tasker-loop-max <n>` — the tasker improver loop's in-context convergence cap (`do spec:` path). Resolves into the `taskerLoopMax` config key. */
@@ -813,6 +826,8 @@ interface IntakeFlags {
 	tasksLandIn?: string;
 	agentCmd?: string;
 	model?: string;
+	/** `--intake-model <id>` — the intake decision agent's model (falls back to `--model`). */
+	intakeModel?: string;
 	harness?: string;
 	piBin?: string;
 	sessionsDir?: string;
@@ -1492,6 +1507,10 @@ export function buildProgram(): Command {
 			'model the agent runs on (routing intent; auth/keys stay the harness\u2019s job). pi: passed as --model; null/shell: substitutes a {model} placeholder in agentCmd. Resolved flag > env > per-repo > global > default (unset).',
 		)
 		.option(
+			'--build-model <id>',
+			'model the BUILD agent runs on (the builder-specific override of --model). Unset at every level inherits --model. Resolved flag > env > per-repo > global > fallback to model > default (unset).',
+		)
+		.option(
 			'--harness <adapter>',
 			'harness adapter that launches the agent + reports liveness: null (default, shells out to agentCmd) or pi (the pi CLI)',
 		)
@@ -1515,6 +1534,10 @@ export function buildProgram(): Command {
 		.option(
 			'--review-model <id>',
 			'model the Gate-2 review agent runs on (de-correlated from the builder; routing intent). Resolved flag > env > per-repo > global > default.',
+		)
+		.option(
+			'--triage-model <id>',
+			'model the advance lifecycle gates (surface, apply, triage) run on. Unset at every level inherits --model. Resolved flag > env > per-repo > global > fallback to model > default (unset).',
 		)
 		.option(
 			'--review-max-rounds <n>',
@@ -2324,6 +2347,10 @@ export function buildProgram(): Command {
 			'model the agent runs on (routing intent; resolved flag > env > per-repo > global > default)',
 		)
 		.option(
+			'--build-model <id>',
+			'model the BUILD agent runs on (the builder-specific override of --model). Unset at every level inherits --model. Resolved flag > env > per-repo > global > fallback to model > default (unset).',
+		)
+		.option(
 			'--harness <adapter>',
 			'harness adapter that launches the agent: null (default, shells out to agentCmd) or pi (the pi CLI)',
 		)
@@ -2350,6 +2377,10 @@ export function buildProgram(): Command {
 		.option(
 			'--review-model <id>',
 			'model the Gate-2 review agent runs on (de-correlated from the builder; routing intent). Resolved flag > env > per-repo > global > default.',
+		)
+		.option(
+			'--triage-model <id>',
+			'model the advance lifecycle gates (surface, apply, triage) run on. Unset at every level inherits --model. Resolved flag > env > per-repo > global > fallback to model > default (unset).',
 		)
 		.option(
 			'--review-max-rounds <n>',
@@ -2620,7 +2651,7 @@ export function buildProgram(): Command {
 					noPR: remoteConfig.noPR,
 					harness: remoteHarness,
 					agentCmd: remoteConfig.agentCmd,
-					model: remoteConfig.model,
+					model: remoteConfig.buildModel,
 					sessionsDir: remoteConfig.sessionsDir,
 					review: remoteConfig.review,
 					reviewModel: remoteConfig.reviewModel,
@@ -2799,7 +2830,7 @@ export function buildProgram(): Command {
 				noPR: config.noPR,
 				harness,
 				agentCmd: config.agentCmd,
-				model: config.model,
+				model: config.buildModel,
 				// The HOST-ONLY sessions root (resolved Config → DoOptions bridge, like
 				// model/agentCmd): the path generator turns it into
 				// `<sessionsDir>/<id>.jsonl` for `--session`. Without this map the key
@@ -3132,7 +3163,7 @@ export function buildProgram(): Command {
 					noPR: remoteConfig.noPR,
 					harness: isoHarness,
 					agentCmd: remoteConfig.agentCmd,
-					model: remoteConfig.model,
+					model: remoteConfig.buildModel,
 					sessionsDir: remoteConfig.sessionsDir,
 					review: remoteConfig.review,
 					reviewModel: remoteConfig.reviewModel,
@@ -3174,18 +3205,18 @@ export function buildProgram(): Command {
 						harness: isoHarness,
 						agentCmd: remoteConfig.agentCmd,
 					}),
-					surfaceModel: remoteConfig.model,
+					surfaceModel: remoteConfig.triageModel,
 					applyDecide: harnessApplyDecider({
 						harness: isoHarness,
 						agentCmd: remoteConfig.agentCmd,
 					}),
-					applyModel: remoteConfig.model,
+					applyModel: remoteConfig.triageModel,
 					observationTriage: remoteConfig.observationTriage,
 					triageGate: harnessTriageGate({
 						harness: isoHarness,
 						agentCmd: remoteConfig.agentCmd,
 					}),
-					triageModel: remoteConfig.model,
+					triageModel: remoteConfig.triageModel,
 					note: (message) => console.error(`>> ${message}`),
 					env: process.env,
 				};
@@ -3276,7 +3307,7 @@ export function buildProgram(): Command {
 				noPR: config.noPR,
 				harness,
 				agentCmd: config.agentCmd,
-				model: config.model,
+				model: config.buildModel,
 				sessionsDir: config.sessionsDir,
 				review: config.review,
 				reviewModel: config.reviewModel,
@@ -3312,12 +3343,12 @@ export function buildProgram(): Command {
 				arbiter: flags.arbiter ?? config.defaultArbiter,
 				doOptions,
 				surfaceGate: harnessSurfaceGate({harness, agentCmd: config.agentCmd}),
-				surfaceModel: config.model,
+				surfaceModel: config.triageModel,
 				applyDecide: harnessApplyDecider({harness, agentCmd: config.agentCmd}),
-				applyModel: config.model,
+				applyModel: config.triageModel,
 				observationTriage: config.observationTriage,
 				triageGate: harnessTriageGate({harness, agentCmd: config.agentCmd}),
-				triageModel: config.model,
+				triageModel: config.triageModel,
 				note: (message) => console.error(`>> ${message}`),
 			};
 
@@ -4387,6 +4418,10 @@ export function buildProgram(): Command {
 			'model the decision agent runs on (routing intent; resolved flag > env > per-repo > global > default)',
 		)
 		.option(
+			'--intake-model <id>',
+			'model the intake decision agent runs on (the builder-specific override of --model). Unset at every level inherits --model. Resolved flag > env > per-repo > global > fallback to model > default (unset).',
+		)
+		.option(
 			'--harness <adapter>',
 			'harness adapter that launches the decision agent: null (default) or pi',
 		)
@@ -4420,6 +4455,11 @@ export function buildProgram(): Command {
 					...harnessFlagOverrides(flags),
 					// `--no-pr` (the PR-INTENT axis) rides the SAME chain.
 					...noPRFlagOverrides(flags),
+					// `--intake-model` rides the SAME chain (falls back to `model`
+					// when unset at all levels via `applyModelFallbacks`).
+					...(flags.intakeModel !== undefined
+						? {intakeModel: flags.intakeModel}
+						: {}),
 				},
 			});
 			if (resolved.message) {
@@ -4534,7 +4574,7 @@ export function buildProgram(): Command {
 				explicitTasksLandIn,
 				harness,
 				agentCmd: config.agentCmd,
-				model: config.model,
+				model: config.intakeModel,
 				sessionsDir: config.sessionsDir,
 				// Host-only runner IDENTITY — scopes intake's `gh`/git ops (not the
 				// decision/review AGENT launches); absent ⇒ ambient.

@@ -834,8 +834,9 @@ async function runOneItem(
 
 		// 4. Run the agent — via the injected runner (tests) or the harness seam
 		//    (null adapter by default), shelling out to the configured agentCmd. The
-		//    resolved per-repo `model` (ADR §13) flows through the seam to the adapter;
-		//    a `{model}`-in-agentCmd misconfiguration surfaces as agent-failed.
+		//    resolved per-repo `buildModel` (ADR §13, which inherits the general
+		//    `model` when unset) flows through the seam to the adapter; a
+		//    `{model}`-in-agentCmd misconfiguration surfaces as agent-failed.
 		let agent: {ok: boolean; detail?: string; output?: string};
 		try {
 			agent = runAgent(
@@ -844,7 +845,7 @@ async function runOneItem(
 				prompt,
 				slug,
 				config.agentCmd,
-				config.model,
+				config.buildModel,
 				config.sessionsDir,
 			);
 		} catch (err) {

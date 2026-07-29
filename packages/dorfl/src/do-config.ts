@@ -17,6 +17,8 @@ import type {
 export interface HarnessFlags {
 	agentCmd?: string;
 	model?: string;
+	/** `--build-model <id>` — the builder-specific model override (falls back to `--model`). */
+	buildModel?: string;
 	harness?: string;
 	piBin?: string;
 	/**
@@ -42,6 +44,9 @@ export function harnessFlagOverrides(flags: HarnessFlags): PartialConfig {
 	}
 	if (flags.model !== undefined) {
 		overrides.model = flags.model;
+	}
+	if (flags.buildModel !== undefined) {
+		overrides.buildModel = flags.buildModel;
 	}
 	if (flags.harness === 'null' || flags.harness === 'pi') {
 		overrides.harness = flags.harness;
@@ -69,6 +74,7 @@ export function doFlagOverrides(
 	flags: HarnessFlags &
 		ReviewFlags &
 		TaskerLoopFlags &
+		TriageModelFlags &
 		FreshWorktreeGateFlags &
 		SelectionOrderFlags &
 		ObservationTriageFlags &
@@ -115,6 +121,10 @@ export function doFlagOverrides(
 		// family from the gate's `--review*`, never sharing a flag/key/field name.
 		// The flag fields bridge onto the `taskerLoop*` config keys.
 		...taskerLoopFlagOverrides(flags),
+		// `--triage-model <id>` (the advance lifecycle gates' model — surface, apply,
+		// triage) rides the SAME chain. DISTINCT from `--review-model`/
+		// `--tasker-loop-model`; falls back to `model` when unset at all levels.
+		...triageModelFlagOverrides(flags),
 		// `--fresh-worktree-gate`/`--no-fresh-worktree-gate` (run the acceptance gate
 		// against the REBASED tip in a clean throwaway worktree, ON by default) rides
 		// the SAME chain — a DISTINCT family from `--review*`/`--tasker-loop*`.
@@ -228,6 +238,32 @@ export function taskerLoopFlagOverrides(flags: TaskerLoopFlags): PartialConfig {
 	}
 	if (flags.taskerLoopModel !== undefined) {
 		overrides.taskerLoopModel = flags.taskerLoopModel;
+	}
+	return overrides;
+}
+
+/**
+ * The `--triage-model` flag — the model the advance lifecycle gates (surface,
+ * apply, triage) run on. A single string flag, distinct from the harness
+ * `--model`/`--build-model` family and from `--review-model`/
+ * `--tasker-loop-model`. Resolved through the SAME `flag > env > per-repo >
+ * global > default` chain; falls back to `model` when unset at all levels (via
+ * `applyModelFallbacks`).
+ */
+export interface TriageModelFlags {
+	/** `--triage-model <id>` — the advance lifecycle gates' model (routing intent). */
+	triageModel?: string;
+}
+
+/**
+ * Map the `--triage-model` flag into a {@link PartialConfig} override. Only
+ * contributes when the flag is actually present (absent flag => absent key), so
+ * the override layer never clobbers a lower-precedence source with `undefined`.
+ */
+export function triageModelFlagOverrides(flags: TriageModelFlags): PartialConfig {
+	const overrides: PartialConfig = {};
+	if (flags.triageModel !== undefined) {
+		overrides.triageModel = flags.triageModel;
 	}
 	return overrides;
 }

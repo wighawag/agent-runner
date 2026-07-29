@@ -41,17 +41,19 @@ describe('doFlagOverrides — folds the do CLI flags into a PartialConfig', () =
 		expect(overrides.harness).toBe('pi');
 	});
 
-	it('maps --agent-cmd / --pi-bin / --model', () => {
+	it('maps --agent-cmd / --pi-bin / --model / --build-model', () => {
 		const overrides = doFlagOverrides({
 			harness: 'null',
 			agentCmd: 'run-agent --slug',
 			piBin: '/opt/pi',
 			model: 'anthropic/x',
+			buildModel: 'anthropic/build',
 		});
 		expect(overrides.harness).toBe('null');
 		expect(overrides.agentCmd).toBe('run-agent --slug');
 		expect(overrides.piBin).toBe('/opt/pi');
 		expect(overrides.model).toBe('anthropic/x');
+		expect(overrides.buildModel).toBe('anthropic/build');
 	});
 
 	it('folds the integrate-time mode in (so {integration} is NOT lost)', () => {

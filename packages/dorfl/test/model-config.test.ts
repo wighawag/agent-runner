@@ -9,7 +9,8 @@ import {
 } from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {DEFAULT_CONFIG, mergeConfig} from '../src/config.js';
+import {DEFAULT_CONFIG, mergeConfig, applyModelFallbacks} from '../src/config.js';
+import {envOverrides, envVarName} from '../src/env-config.js';
 import {
 	REPO_ALLOWED_KEYS,
 	REPO_REJECTED_KEYS,
@@ -61,8 +62,9 @@ describe('repo-config — model + harness allowed per-repo, piBin rejected', () 
 		writeFileSync(join(repo, REPO_CONFIG_FILENAME), JSON.stringify(value));
 	}
 
-	it('treats model + harness as repo-appropriate keys', () => {
+	it('treats model + buildModel + harness as repo-appropriate keys', () => {
 		expect(REPO_ALLOWED_KEYS).toContain('model');
+		expect(REPO_ALLOWED_KEYS).toContain('buildModel');
 		expect(REPO_ALLOWED_KEYS).toContain('harness');
 	});
 
@@ -301,5 +303,152 @@ describe('PiHarness — native --model injection (stubbed pi CLI)', () => {
 		expect(args).toContain('a/b');
 		expect(args).toContain('--flag');
 		expect(args).toContain('value');
+	});
+});
+
+describe('applyModelFallbacks — per-role models inherit the general model', () => {
+	it('buildModel, reviewModel, taskerLoopModel, triageModel, intakeModel each inherit model when unset', () => {
+		const config = mergeConfig({model: 'general/m'});
+		applyModelFallbacks(config);
+		expect(config.buildModel).toBe('general/m');
+		expect(config.reviewModel).toBe('general/m');
+		expect(config.taskerLoopModel).toBe('general/m');
+		expect(config.triageModel).toBe('general/m');
+		expect(config.intakeModel).toBe('general/m');
+	});
+
+	it('does NOT touch a per-role model that is already set', () => {
+		const config = mergeConfig({
+			model: 'general/m',
+			buildModel: 'build/m',
+			reviewModel: 'review/m',
+			taskerLoopModel: 'loop/m',
+			triageModel: 'triage/m',
+			intakeModel: 'intake/m',
+		});
+		applyModelFallbacks(config);
+		expect(config.buildModel).toBe('build/m');
+		expect(config.reviewModel).toBe('review/m');
+		expect(config.taskerLoopModel).toBe('loop/m');
+		expect(config.triageModel).toBe('triage/m');
+		expect(config.intakeModel).toBe('intake/m');
+	});
+
+	it('leaves everything undefined when model is also unset', () => {
+		const config = mergeConfig({});
+		applyModelFallbacks(config);
+		expect(config.buildModel).toBeUndefined();
+		expect(config.reviewModel).toBeUndefined();
+		expect(config.taskerLoopModel).toBeUndefined();
+		expect(config.triageModel).toBeUndefined();
+		expect(config.intakeModel).toBeUndefined();
+	});
+});
+
+describe('resolveRepoConfig — per-role model fallback uses the FINAL resolved model', () => {
+	let repo: string;
+
+	beforeEach(() => {
+		repo = mkdtempSync(join(tmpdir(), 'dorfl-model-fallback-'));
+	});
+	afterEach(() => {
+		rmSync(repo, {recursive: true, force: true});
+	});
+
+	function writeRepoConfig(value: unknown): void {
+		writeFileSync(join(repo, REPO_CONFIG_FILENAME), JSON.stringify(value));
+	}
+
+	it('reviewModel inherits the resolved model when reviewModel is unset at all levels', () => {
+		writeRepoConfig({model: 'repo/m'});
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({}),
+		});
+		expect(resolved.config.model).toBe('repo/m');
+		expect(resolved.config.reviewModel).toBe('repo/m');
+		expect(resolved.config.buildModel).toBe('repo/m');
+		expect(resolved.config.taskerLoopModel).toBe('repo/m');
+		expect(resolved.config.triageModel).toBe('repo/m');
+		expect(resolved.config.intakeModel).toBe('repo/m');
+	});
+
+	it('a per-repo reviewModel is NOT reset by a higher-precedence --model flag', () => {
+		writeRepoConfig({reviewModel: 'repo/review'});
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({}),
+			flags: {model: 'flag/m'},
+		});
+		// The flag sets the general model, but reviewModel was set by per-repo
+		// config — it is NOT reset by the fallback.
+		expect(resolved.config.model).toBe('flag/m');
+		expect(resolved.config.reviewModel).toBe('repo/review');
+		expect(resolved.config.buildModel).toBe('flag/m');
+	});
+
+	it('a global reviewModel is NOT reset by a higher-precedence --model flag', () => {
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({reviewModel: 'global/review'}),
+			flags: {model: 'flag/m'},
+		});
+		expect(resolved.config.model).toBe('flag/m');
+		expect(resolved.config.reviewModel).toBe('global/review');
+	});
+
+	it('the fallback uses the FINAL resolved model, not an intermediate layer', () => {
+		// global has model: 'global/m', per-repo has model: 'repo/m'. The fallback
+		// for reviewModel should be 'repo/m' (the final resolved model), NOT
+		// 'global/m' (the global layer's model).
+		writeRepoConfig({model: 'repo/m'});
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({model: 'global/m'}),
+		});
+		expect(resolved.config.model).toBe('repo/m');
+		expect(resolved.config.reviewModel).toBe('repo/m');
+	});
+
+	it('env buildModel inherits model when buildModel is unset', () => {
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({}),
+			env: {DORFL_MODEL: 'env/m'},
+		});
+		expect(resolved.config.model).toBe('env/m');
+		expect(resolved.config.buildModel).toBe('env/m');
+		expect(resolved.config.reviewModel).toBe('env/m');
+	});
+
+	it('an explicit buildModel does NOT inherit model (set at its own level)', () => {
+		const resolved = resolveRepoConfig({
+			repoPath: repo,
+			global: mergeConfig({model: 'global/m'}),
+			env: {DORFL_BUILD_MODEL: 'env/build'},
+		});
+		expect(resolved.config.model).toBe('global/m');
+		expect(resolved.config.buildModel).toBe('env/build');
+		// reviewModel still inherits the resolved model.
+		expect(resolved.config.reviewModel).toBe('global/m');
+	});
+});
+
+describe('env-config — DORFL_BUILD_MODEL is coerced as a string', () => {
+	it('is recognised as a string env var', () => {
+		expect(envVarName('buildModel')).toBe('DORFL_BUILD_MODEL');
+		const o = envOverrides({DORFL_BUILD_MODEL: 'env/build'});
+		expect(o.buildModel).toBe('env/build');
+	});
+
+	it('DORFL_TRIAGE_MODEL and DORFL_INTAKE_MODEL are recognised as string env vars', () => {
+		expect(envVarName('triageModel')).toBe('DORFL_TRIAGE_MODEL');
+		expect(envVarName('intakeModel')).toBe('DORFL_INTAKE_MODEL');
+		const o = envOverrides({
+			DORFL_TRIAGE_MODEL: 'env/triage',
+			DORFL_INTAKE_MODEL: 'env/intake',
+		});
+		expect(o.triageModel).toBe('env/triage');
+		expect(o.intakeModel).toBe('env/intake');
 	});
 });

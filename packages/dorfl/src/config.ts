@@ -528,9 +528,25 @@ export interface Config {
 	 * (`LaunchInput.model`); the ADAPTER decides HOW it reaches its tool — the pi
 	 * adapter passes `--model <model>` natively, the null/shell adapter substitutes
 	 * a `{model}` placeholder in `agentCmd`. Resolved per-repo like `integration`:
-	 * flag (`--model`) > env > per-repo > global > default (unset).
+	 * flag (`--model`) > env > per-repo > global > default (unset). The fallback
+	 * to this field from `buildModel` / `reviewModel` / `taskerLoopModel` is
+	 * applied AFTER the full precedence chain resolves (in `applyModelFallbacks`),
+	 * so a per-role knob set at ANY level (even global config) is NEVER reset by a
+	 * higher-precedence `--model`.
 	 */
 	model?: string;
+	/**
+	 * The model the BUILD agent runs on (the builder-specific override of the
+	 * general `model`). Optional with NO default so "unset" means "inherit the
+	 * general `model`" (via `applyModelFallbacks`, applied at the resolution FINAL
+	 * point — after the full flag > env > per-repo > global chain). Carried to the
+	 * build launch through the same harness seam (`LaunchInput.model`). Resolved
+	 * per-repo like `model`: flag (`--build-model`) > env (`DORFL_BUILD_MODEL`) >
+	 * per-repo > global > fallback to `model` > default (unset). DISTINCT from
+	 * `reviewModel` (Gate 2) and `taskerLoopModel` (the improver loop) — each has
+	 * its OWN knob and each falls back to `model` independently.
+	 */
+	buildModel?: string;
 	/**
 	 * Which harness adapter launches + reports liveness for a job's agent (the
 	 * harness seam, ADR §5): `null` (default — shells out to `agentCmd`,
@@ -600,11 +616,14 @@ export interface Config {
 	review: boolean;
 	/**
 	 * The model the REVIEW agent runs on (de-correlation from the builder's
-	 * `model`). Optional with NO default so "unset" means "no forced review model"
-	 * (the harness's own default). Carried to the review-agent launch through the
-	 * EXISTING harness seam (`LaunchInput.model` / `substituteModel`) — NOT a new
-	 * mechanism. Resolved like `model`: flag (`--review-model`) > env > per-repo >
-	 * global > default (unset). Distinct from the builder's `model`.
+	 * `buildModel` when explicitly set). Optional with NO default so "unset" means
+	 * "inherit the general `model`" (via `applyModelFallbacks`, applied at the
+	 * resolution FINAL point — after the full flag > env > per-repo > global chain).
+	 * Carried to the review-agent launch through the EXISTING harness seam
+	 * (`LaunchInput.model` / `substituteModel`) — NOT a new mechanism. Resolved like
+	 * `model`: flag (`--review-model`) > env > per-repo > global > fallback to
+	 * `model` > default (unset). Distinct from the builder's `buildModel` — each
+	 * has its OWN knob and each falls back to `model` independently.
 	 */
 	reviewModel?: string;
 	/**
@@ -650,14 +669,44 @@ export interface Config {
 	taskerLoopMax: number;
 	/**
 	 * The model the tasker IMPROVER loop's review agent runs on (de-correlation
-	 * from the tasker). Optional with NO default so "unset" means "no forced model"
-	 * (the harness's own default). Carried to the review-agent launch through the
-	 * EXISTING harness seam (`LaunchInput.model` / `substituteModel`). Resolved like
-	 * `model`: flag (`--tasker-loop-model`) > env > per-repo > global > default
-	 * (unset). DISTINCT from the acceptance gate's `reviewModel` (build
-	 * `--review-model`).
+	 * from the tasker when explicitly set). Optional with NO default so "unset"
+	 * means "inherit the general `model`" (via `applyModelFallbacks`, applied at
+	 * the resolution FINAL point — after the full flag > env > per-repo > global
+	 * chain). Carried to the review-agent launch through the EXISTING harness seam
+	 * (`LaunchInput.model` / `substituteModel`). Resolved like `model`: flag
+	 * (`--tasker-loop-model`) > env > per-repo > global > fallback to `model` >
+	 * default (unset). DISTINCT from the acceptance gate's `reviewModel` (build
+	 * `--review-model`) and from `buildModel` — each has its OWN knob and each falls
+	 * back to `model` independently.
 	 */
 	taskerLoopModel?: string;
+	/**
+	 * The model the ADVANCE LIFECYCLE GATES (surface, apply, triage) run on —
+	 * the fresh-context judgement agents that surface questions from blocked work
+	 * (`surface`), interpret answered questions and decide what to mint (`apply`),
+	 * and auto-disposition no-question observations (`triage`). Optional with NO
+	 * default so "unset" means "inherit the general `model`" (via
+	 * `applyModelFallbacks`, applied at the resolution FINAL point). Carried to each
+	 * gate's launch through the EXISTING harness seam (`LaunchInput.model`). Resolved
+	 * like `model`: flag (`--triage-model`) > env (`DORFL_TRIAGE_MODEL`) > per-repo >
+	 * global > fallback to `model` > default (unset). DISTINCT from `reviewModel`,
+	 * `taskerLoopModel`, `buildModel`, and `intakeModel` — each has its OWN knob and
+	 * each falls back to `model` independently.
+	 */
+	triageModel?: string;
+	/**
+	 * The model the INTAKE decision agent runs on — the front-door fresh-context
+	 * agent that reads an issue/PR and decides whether to mint a task, mint a spec,
+	 * or ask a follow-up question. Optional with NO default so "unset" means
+	 * "inherit the general `model`" (via `applyModelFallbacks`, applied at the
+	 * resolution FINAL point). Carried to the intake-agent launch through the
+	 * EXISTING harness seam (`LaunchInput.model`). Resolved like `model`: flag
+	 * (`--intake-model`) > env (`DORFL_INTAKE_MODEL`) > per-repo > global > fallback
+	 * to `model` > default (unset). DISTINCT from the advance lifecycle gates'
+	 * `triageModel` and from `buildModel`/`reviewModel`/`taskerLoopModel` — each has
+	 * its OWN knob and each falls back to `model` independently.
+	 */
+	intakeModel?: string;
 	/**
 	 * **The fresh-worktree acceptance-gate toggle** (`--fresh-worktree-gate` /
 	 * `--no-fresh-worktree-gate`). When ON (the default), the acceptance gate
@@ -1076,6 +1125,35 @@ export function mergeConfig(overrides: PartialConfig): Config {
 		}
 	}
 	return merged;
+}
+
+/**
+ * Apply the per-role model fallbacks IN PLACE on a FULLY RESOLVED {@link Config}:
+ * `buildModel`, `reviewModel`, and `taskerLoopModel` each inherit the general
+ * `model` when they are unset (i.e. were not set at ANY precedence level — flag,
+ * env, per-repo, or global). This is the single place the fallback lives; it is
+ * called at the resolution FINAL points (`resolveRepoConfigFromLoaded` for the
+ * per-repo chain; `resolveGlobalConfig` for the global-only chain) so the
+ * fallback uses the FINAL resolved `model`, never an intermediate layer's. A
+ * per-role knob set at ANY level is NEVER reset — `applyModelFallbacks` only
+ * touches fields that are still `undefined` after the full chain resolved.
+ */
+export function applyModelFallbacks(config: Config): void {
+	if (config.buildModel === undefined) {
+		config.buildModel = config.model;
+	}
+	if (config.reviewModel === undefined) {
+		config.reviewModel = config.model;
+	}
+	if (config.taskerLoopModel === undefined) {
+		config.taskerLoopModel = config.model;
+	}
+	if (config.triageModel === undefined) {
+		config.triageModel = config.model;
+	}
+	if (config.intakeModel === undefined) {
+		config.intakeModel = config.model;
+	}
 }
 
 /**
