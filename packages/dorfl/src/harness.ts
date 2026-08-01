@@ -210,6 +210,36 @@ export interface LaunchResult {
 	 * part from its `--format json` stream — the SAME `output` field.
 	 */
 	output?: string;
+	/**
+	 * **The verified outcome of reaping the agent's process TREE** after a deadline
+	 * stop (observation
+	 * `checkpoint-releases-lock-while-predecessor-agent-still-writes`).
+	 *
+	 * Only present when {@link timedOut} is set — i.e. when the harness itself
+	 * signalled the agent and therefore owes the caller PROOF that it is gone
+	 * rather than merely signalled. `reaped: false` means a descendant may still be
+	 * writing to the worktree, so the caller MUST NOT release the item lock or let
+	 * a successor agent onboard there (see `do.ts`'s deadline routing).
+	 *
+	 * Absent on a normal exit (nothing was signalled, so there is nothing to prove)
+	 * and on adapters that do not spawn a killable process group.
+	 */
+	reap?: AgentTreeReap;
+}
+
+/**
+ * The harness-reported result of reaping a stopped agent's process tree — the
+ * adapter-agnostic projection of `reap-agent-tree.ts`'s `ReapResult`.
+ */
+export interface AgentTreeReap {
+	/** True iff the tree is VERIFIED gone (observed, not merely signalled). */
+	reaped: boolean;
+	/** The process group that was reaped (the agent's group-leader pid). */
+	pgid?: number;
+	/** True iff SIGKILL was needed because the tree ignored SIGTERM. */
+	escalatedToSigkill?: boolean;
+	/** Human-readable account — the LOUD text when `reaped` is false. */
+	detail: string;
 }
 
 /**

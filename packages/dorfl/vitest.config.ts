@@ -258,7 +258,7 @@ const RACE_SENSITIVE = [
 	// 17/17 in isolation in ~5s). Run it sequentially for the same deterministic
 	// claim/main-CAS reasoning as do.test.ts / do-remote.test.ts.
 	'test/complete-self-renaming-folder-task.test.ts',
-	// The post-write-verification regression tests (observation
+	// The Defect-1 post-write-verification regression tests (observation
 	// `checkpoint-path-reports-its-own-write-as-absent`): drive real git against a
 	// --bare arbiter through the write seam's CAS + the tree-less surface loop AND
 	// write main (surface commits), including a BARE-HUB-MIRROR job worktree whose
@@ -266,6 +266,15 @@ const RACE_SENSITIVE = [
 	// bounce-surface-primitive.test.ts; run sequentially for the same deterministic
 	// claim/main-CAS reasoning.
 	'test/post-write-verify-mirror-view.test.ts',
+	// The Defect-2 process-tree reap tests (observation
+	// `checkpoint-releases-lock-while-predecessor-agent-still-writes`): spawn a
+	// stubbed pi whose DESCENDANT outlives it, race a short (~400ms) deadline, and
+	// assert the launch does not resolve until the whole process group is verified
+	// gone — plus a `performDo` deadline-routing pair that writes main against a
+	// --bare arbiter. Both the deadline race and the main-CAS want to be out of
+	// file-parallel pressure (CPU contention widens the signal/exit window), so run
+	// sequentially for the same reasoning as do-watch.test.ts.
+	'test/checkpoint-reaps-agent-tree.test.ts',
 	// The isolated-`do` SEQUENTIAL-REFETCH FRESHNESS drain (~L445): drives
 	// `performDoRemote(Auto)` against a --bare arbiter (hub mirror + job worktree),
 	// runs the pipeline, AND writes main (the autonomous needs-attention surfacing)

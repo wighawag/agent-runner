@@ -13,6 +13,7 @@ import {
 } from './harness.js';
 import {generateSessionPath} from './session-path.js';
 import {lastAssistantText} from './watch-session.js';
+import {reapProcessGroup} from './reap-agent-tree.js';
 import type {HarnessAdapter} from './config.js';
 
 /**
@@ -237,8 +238,46 @@ export class PiHarness implements Harness {
 				cwd: input.dir,
 				env: input.env ?? process.env,
 				stdio: ['pipe', 'pipe', 'pipe'],
+				// PROCESS-GROUP LEADER (observation
+				// `checkpoint-releases-lock-while-predecessor-agent-still-writes`): pi's
+				// pgid becomes its own pid, so the deadline stop can signal the WHOLE
+				// agent tree with `kill(-pgid)` and VERIFY it is gone. Without this,
+				// `child.kill()` reached exactly one pid: subagents / MCP servers / tool
+				// subshells survived, were re-parented to init (so no ppid walk could even
+				// find them), and kept writing into the worktree while a SUCCESSOR agent
+				// was already editing it. A pgid is inherited by every descendant and is
+				// unaffected by re-parenting, which is why it is the only usable handle.
+				// We deliberately do NOT `unref()` here: the parent keeps supervising the
+				// child (and forwards its own termination to the group, below).
+				detached: true,
 			});
 			record.pid = child.pid; // the liveness anchor, recorded like spawnSync.
+			// The group id equals the leader's pid because we spawned `detached`.
+			const pgid = child.pid;
+			// `detached: true` takes pi OUT of our terminal's foreground process group,
+			// so a Ctrl-C / `kill` aimed at the runner would no longer reach it — which
+			// would WIDEN the very "aborting `do` does not kill the spawned agent tree"
+			// gap this change is closing. Forward our own termination to the group for
+			// as long as the child is live, so detaching strictly improves reachability
+			// instead of trading one orphan class for another.
+			const forwardSignal = (signal: NodeJS.Signals) => (): void => {
+				if (pgid === undefined) {
+					return;
+				}
+				try {
+					process.kill(-pgid, signal);
+				} catch {
+					// Already gone; nothing to forward to.
+				}
+			};
+			const onSigint = forwardSignal('SIGINT');
+			const onSigterm = forwardSignal('SIGTERM');
+			process.on('SIGINT', onSigint);
+			process.on('SIGTERM', onSigterm);
+			const stopForwarding = (): void => {
+				process.off('SIGINT', onSigint);
+				process.off('SIGTERM', onSigterm);
+			};
 			let stderr = '';
 			child.stderr?.on('data', (chunk: Buffer) => {
 				stderr += chunk.toString('utf8');
@@ -276,18 +315,29 @@ export class PiHarness implements Harness {
 						return;
 					}
 					timedOut = true;
+					// Signal the whole GROUP, not just pi: the descendants are exactly the
+					// processes that outlive it and keep writing to the worktree.
 					try {
-						child.kill('SIGTERM');
+						if (pgid !== undefined) {
+							process.kill(-pgid, 'SIGTERM');
+						} else {
+							child.kill('SIGTERM');
+						}
 					} catch {
-						// Best-effort: a already-exited child throws ESRCH; the `exit`
-						// handler will still settle the promise.
+						// Best-effort: an already-exited group throws ESRCH; the `exit`
+						// handler will still settle the promise, and the post-exit reap below
+						// is what actually VERIFIES the tree is gone.
 					}
 					hardTimer = setTimeout(() => {
 						if (settled) {
 							return;
 						}
 						try {
-							child.kill('SIGKILL');
+							if (pgid !== undefined) {
+								process.kill(-pgid, 'SIGKILL');
+							} else {
+								child.kill('SIGKILL');
+							}
 						} catch {
 							// Best-effort: see above.
 						}
@@ -302,6 +352,7 @@ export class PiHarness implements Harness {
 				}
 				settled = true;
 				clearDeadlineTimers();
+				stopForwarding();
 				reject(new Error(`failed to spawn pi (${this.piBin}): ${err.message}`));
 			});
 			// Resolve on `exit` (pi itself terminated), NOT `close`: `close` waits for
@@ -314,6 +365,7 @@ export class PiHarness implements Harness {
 				}
 				settled = true;
 				clearDeadlineTimers();
+				stopForwarding();
 				// Release our end of the stdio pipes so a leaked grandchild's inherited
 				// FDs stop keeping our streams referenced; `unref` the child handle too.
 				child.stdout?.destroy();
@@ -321,17 +373,59 @@ export class PiHarness implements Harness {
 				child.stdin?.destroy();
 				child.unref?.();
 				const status = code ?? -1;
-				resolve({
-					ok: status === 0 && !timedOut,
-					record,
-					detail:
-						status === 0 && !timedOut ? undefined : stderr.trim() || undefined,
-					timedOut: timedOut ? true : undefined,
-					// Read the agent's ANSWER from the `.jsonl` at `exit` — the same
-					// last-assistant-text read `launch` does at return (task
-					// `harness-agent-output`); the process has exited so the log is final.
-					output: readLastAssistantText(sessionFile),
-				});
+				const settleWith = (reap?: LaunchResult['reap']): void => {
+					resolve({
+						ok: status === 0 && !timedOut,
+						record,
+						detail:
+							status === 0 && !timedOut
+								? undefined
+								: stderr.trim() || undefined,
+						timedOut: timedOut ? true : undefined,
+						...(reap ? {reap} : {}),
+						// Read the agent's ANSWER from the `.jsonl` at `exit` — the same
+						// last-assistant-text read `launch` does at return (task
+						// `harness-agent-output`); the process has exited so the log is final.
+						output: readLastAssistantText(sessionFile),
+					});
+				};
+				if (!timedOut || pgid === undefined) {
+					// Normal exit: we signalled nothing, so there is nothing to prove and
+					// nothing to kill. Byte-for-byte the pre-existing behaviour — in
+					// particular we do NOT reap a group the agent may have deliberately left
+					// running behind a successful run.
+					settleWith();
+					return;
+				}
+				// DEADLINE STOP: pi's own exit says NOTHING about its descendants — that
+				// assumption is the defect. Before this promise resolves (which is the
+				// runner's cue to save WIP, release the lock and dispatch a SUCCESSOR into
+				// this same worktree), reap the group and VERIFY it is gone. Bounded by
+				// construction, so this cannot reintroduce the resolve-on-`exit` hang the
+				// doc-comment above guards against: a tree that will not die resolves with
+				// `reaped: false` and the caller refuses to release the lock.
+				void reapProcessGroup({pgid})
+					.then((result) => {
+						settleWith({
+							reaped: result.reaped,
+							pgid,
+							escalatedToSigkill: result.escalatedToSigkill,
+							detail: result.detail,
+						});
+					})
+					.catch((err: unknown) => {
+						// A throw here means we could not even RUN the verification, which is
+						// indistinguishable from "might still be alive" — report it as an
+						// unproven reap rather than silently claiming success.
+						settleWith({
+							reaped: false,
+							pgid,
+							detail:
+								`could not verify that the agent process group ${pgid} exited ` +
+								`(${err instanceof Error ? err.message : String(err)}); treating ` +
+								'the predecessor as possibly still writing to the worktree.',
+						});
+					});
 			});
 			// Feed the same prepared prompt on stdin, then close it (pi reads to EOF).
 			if (input.prompt !== undefined) {

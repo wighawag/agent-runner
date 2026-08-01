@@ -17,7 +17,8 @@ import {
 	resolvePromptGuidanceForItem,
 	PromptError,
 } from './prompt.js';
-import {NullHarness, type Harness} from './harness.js';
+import {NullHarness, type AgentTreeReap, type Harness} from './harness.js';
+import {acquireWorktreeWriterLock} from './worktree-writer-lock.js';
 import {PiHarness} from './pi-harness.js';
 import {launchWithOptionalWatch} from './agent-launch.js';
 import {ledgerRead, type LedgerReadStrategy} from './ledger-read.js';
@@ -155,10 +156,27 @@ function deadlineAutoContinueReason(params: {
 }
 function deadlineSurfaceReason(params: {
 	slug: string;
-	kind: 'no-progress' | 'ceiling';
+	kind: 'no-progress' | 'ceiling' | 'unreaped';
 	count?: number;
 	max?: number;
+	/** The harness's loud reap detail (the `unreaped` kind only). */
+	detail?: string;
 }): string {
+	if (params.kind === 'unreaped') {
+		// The auto-continue path is BLOCKED, not merely skipped: releasing the lock
+		// would let a successor onboard into a worktree a live predecessor may still
+		// be writing to (observation
+		// `checkpoint-releases-lock-while-predecessor-agent-still-writes`). The work
+		// is saved and pushed; only the hand-off is withheld.
+		return (
+			`deadline checkpoint (agent NOT verifiably stopped): '${params.slug}' hit ` +
+			'the dorfl-internal deadline and its WIP was saved + pushed, but the agent ' +
+			'process tree could not be confirmed dead, so the lock was NOT released and ' +
+			'no successor was dispatched — a second agent in the same working tree can ' +
+			'clobber or silently absorb the first one\u2019s edits. ' +
+			`${params.detail ?? ''}`.trim()
+		);
+	}
 	if (params.kind === 'no-progress') {
 		return (
 			`deadline checkpoint (no progress / ceiling): '${params.slug}' hit ` +
@@ -329,6 +347,16 @@ export type DoDorfl = (input: {
 	 * injected path — the real deadline race lives in `PiHarness.launchAsync`.
 	 */
 	timedOut?: boolean;
+	/**
+	 * **The simulated process-tree REAP verdict** for a {@link timedOut} stop
+	 * (observation `checkpoint-releases-lock-while-predecessor-agent-still-writes`).
+	 * Test-only signal, the sibling of `timedOut`, so an injected agent can drive
+	 * the "predecessor could not be verified dead" routing — where the checkpoint
+	 * must NOT release the item lock, because the next tick would then onboard a
+	 * successor into a working tree the predecessor may still be writing to.
+	 * Absent ⇒ nothing was left running (the pre-existing behaviour).
+	 */
+	reap?: AgentTreeReap;
 };
 
 export interface DoOptions {
@@ -1306,6 +1334,7 @@ export async function performDo(options: DoOptions): Promise<DoResult> {
 		detail?: string;
 		output?: string;
 		timedOut?: boolean;
+		reap?: AgentTreeReap;
 	};
 	try {
 		agent = await runDoAgent(options, tree.dir, prompt, slug);
@@ -1334,6 +1363,7 @@ export async function performDo(options: DoOptions): Promise<DoResult> {
 			cwd: tree.dir,
 			arbiter: tree.arbiterRemote,
 			maxAutoCheckpoints: options.maxAutoCheckpoints ?? 5,
+			reap: agent.reap,
 			env,
 			note,
 		});
@@ -1952,11 +1982,58 @@ async function runDoAgent(
 	detail?: string;
 	output?: string;
 	timedOut?: boolean;
+	reap?: AgentTreeReap;
 }> {
 	if (options.dorfl) {
 		return options.dorfl({cwd, prompt, slug, env: options.env});
 	}
 	const harness = options.harness ?? new NullHarness();
+
+	// WORKING-TREE SENTINEL (observation
+	// `checkpoint-releases-lock-while-predecessor-agent-still-writes`): the item
+	// lock guards the ITEM; this guards the TREE. A deadline checkpoint releases the
+	// item lock so the next tick can continue the task in the SAME worktree, so the
+	// item lock alone cannot keep a successor out while a predecessor is still
+	// alive. Refuse to launch a second agent into a tree that already has a LIVE
+	// writer, independently of the reap. A dead holder's sentinel is stale and taken
+	// over, so a crashed runner never poisons the worktree.
+	const writer = acquireWorktreeWriterLock({dir: cwd, slug, env: options.env});
+	if (!writer.acquired) {
+		return {ok: false, detail: writer.reason};
+	}
+	try {
+		return await launchAgentUnderWriterLock({
+			options,
+			cwd,
+			prompt,
+			slug,
+			harness,
+		});
+	} finally {
+		writer.release();
+	}
+}
+
+/**
+ * The actual harness launch, run while this process holds the worktree writer
+ * sentinel (see {@link runDoAgent}). Split out purely so the sentinel's
+ * acquire/release brackets the launch in a `try/finally` without indenting the
+ * whole body.
+ */
+async function launchAgentUnderWriterLock(params: {
+	options: DoAgentLaunchOptions;
+	cwd: string;
+	prompt: string;
+	slug: string;
+	harness: Harness;
+}): Promise<{
+	ok: boolean;
+	detail?: string;
+	output?: string;
+	timedOut?: boolean;
+	reap?: AgentTreeReap;
+}> {
+	const {options, cwd, prompt, slug, harness} = params;
 	// Convert the dorfl-internal deadline (minutes) into a wall-clock epoch-ms so
 	// the harness (`launchAsync`) can race the child against it (spec
 	// `graceful-pre-timeout-wip-checkpoint`). Absent ⇒ no deadline; a run that
@@ -1991,6 +2068,10 @@ async function runDoAgent(
 		detail: launched.detail,
 		output: launched.output,
 		timedOut: launched.timedOut,
+		// The harness's PROOF that a deadline-stopped agent's process tree is gone.
+		// Threaded to {@link routeDeadlineCheckpoint}, which refuses to release the
+		// item lock without it.
+		reap: launched.reap,
 	};
 }
 
@@ -2008,10 +2089,39 @@ async function routeDeadlineCheckpoint(params: {
 	cwd: string;
 	arbiter: string;
 	maxAutoCheckpoints: number;
+	/**
+	 * The harness's VERIFIED reap of the checkpointed agent's process tree. The
+	 * auto-continue branch releases the lock and lets the next tick dispatch a
+	 * SUCCESSOR into this same worktree, so it may only run once the predecessor
+	 * is proven gone (observation
+	 * `checkpoint-releases-lock-while-predecessor-agent-still-writes`). Absent ⮕
+	 * the harness spawned no killable group (test doubles, the null adapter), which
+	 * is treated as "nothing was left running".
+	 */
+	reap?: AgentTreeReap;
 	env: NodeJS.ProcessEnv | undefined;
 	note: (message: string) => void;
 }): Promise<DoResult> {
-	const {slug, branch, cwd, arbiter, maxAutoCheckpoints, env, note} = params;
+	const {slug, branch, cwd, arbiter, maxAutoCheckpoints, reap, env, note} =
+		params;
+
+	// 0. THE PREDECESSOR MUST BE DEAD BEFORE THE LOCK CAN MOVE.
+	//
+	// The item lock guards the ITEM; nothing guards the WORKING TREE. So if we
+	// released the lock while the checkpointed agent's tree were still alive, the
+	// next tick would onboard a successor into the very worktree the predecessor is
+	// still writing to — one lock, one working tree, two live writers. That was
+	// observed in the field: a predecessor kept writing for four minutes into its
+	// successor's run, and its last write landed on a file the successor had already
+	// read as clean in its opening `git status`.
+	//
+	// A reap we could not VERIFY is therefore a hard stop for the auto-continue
+	// path. We still SAVE the work below (never lose work) and still surface the
+	// item, but we do not hand the tree to anybody else.
+	const predecessorGone = reap === undefined || reap.reaped;
+	if (reap !== undefined && reap.escalatedToSigkill && reap.reaped) {
+		note(`Deadline checkpoint for '${slug}': ${reap.detail}`);
+	}
 
 	// 1. ALWAYS save the WIP first: commit any residue + push the work branch.
 	const savedReason = `deadline checkpoint save for '${slug}'`;
@@ -2040,7 +2150,11 @@ async function routeDeadlineCheckpoint(params: {
 		env,
 	});
 
-	if (madeProgressThisSession && checkpointCount <= maxAutoCheckpoints) {
+	if (
+		predecessorGone &&
+		madeProgressThisSession &&
+		checkpointCount <= maxAutoCheckpoints
+	) {
 		// AUTO-CONTINUE: release the lock via the SAME default keep+continue path
 		// `requeue` uses (no --reset, no --reconcile, no sidecar). The branch is
 		// KEPT on the arbiter so the next claim continues from its tip.
@@ -2097,14 +2211,16 @@ async function routeDeadlineCheckpoint(params: {
 	// SURFACE: mark the lock stuck via the whole applyNeedsAttentionTransition
 	// (save + push + stuck). The WIP was already saved above; a second save is
 	// idempotent (empty commit is skipped inside routeToNeedsAttention).
-	const surfaceReason = madeProgressThisSession
-		? deadlineSurfaceReason({
-				slug,
-				kind: 'ceiling',
-				count: checkpointCount,
-				max: maxAutoCheckpoints,
-			})
-		: deadlineSurfaceReason({slug, kind: 'no-progress'});
+	const surfaceReason = !predecessorGone
+		? deadlineSurfaceReason({slug, kind: 'unreaped', detail: reap?.detail})
+		: madeProgressThisSession
+			? deadlineSurfaceReason({
+					slug,
+					kind: 'ceiling',
+					count: checkpointCount,
+					max: maxAutoCheckpoints,
+				})
+			: deadlineSurfaceReason({slug, kind: 'no-progress'});
 	const routed = await ledgerWrite.applyNeedsAttentionTransition({
 		cwd,
 		slug,
@@ -2114,12 +2230,14 @@ async function routeDeadlineCheckpoint(params: {
 		note,
 	});
 	const report = routed.moved ? routeReport(routed, branch) : undefined;
+	const why = !predecessorGone
+		? 'the checkpointed agent could not be verified dead'
+		: madeProgressThisSession
+			? `ceiling ${checkpointCount}/${maxAutoCheckpoints}`
+			: 'no progress this session';
 	const message = routed.moved
-		? `Surfaced '${slug}' at the deadline checkpoint (${
-				madeProgressThisSession
-					? `ceiling ${checkpointCount}/${maxAutoCheckpoints}`
-					: 'no progress this session'
-			}); ${report!.fragment}. ${surfaceReason}`
+		? `Surfaced '${slug}' at the deadline checkpoint (${why}); ` +
+			`${report!.fragment}. ${surfaceReason}`
 		: `Could not surface '${slug}' at the deadline checkpoint ` +
 			`(${routed.reasonNotMoved ?? 'unknown'}). ${surfaceReason}`;
 	note(message);
@@ -2763,6 +2881,7 @@ async function runRemotePipeline(
 		detail?: string;
 		output?: string;
 		timedOut?: boolean;
+		reap?: AgentTreeReap;
 	};
 	try {
 		agent = await runDoAgent(options, cwd, prompt, slug);
@@ -2787,6 +2906,7 @@ async function runRemotePipeline(
 			cwd,
 			arbiter: arbiterRemote,
 			maxAutoCheckpoints: options.maxAutoCheckpoints ?? 5,
+			reap: agent.reap,
 			env,
 			note,
 		});
