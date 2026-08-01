@@ -1,5 +1,6 @@
 import {randomUUID} from 'node:crypto';
 import {runAsync, type RunResult} from './git.js';
+import {refreshArbiterRefs, resolveArbiterBranch} from './arbiter-refs.js';
 import {
 	Integrator,
 	type IntegrateResult,
@@ -560,14 +561,49 @@ export const currentLedgerWrite: LedgerWriteStrategy = {
 			// making" no-op, which is a LOSS. The nonce makes the two naturally
 			// distinguishable: `arbiterHead === nonced` iff WE won. So an up-to-date
 			// no-op can never satisfy this and is classified REJECTED, never published.
-			await gitHard(['fetch', '--quiet', arbiter], cwd, env);
-			const arbiterHead = (
-				await gitHard(['rev-parse', `${arbiter}/main`], cwd, env)
-			).stdout.trim();
-			if (arbiterHead === nonced) {
+			//
+			// The read MUST be ARBITER-AUTHORITATIVE, and used to not be: it was a
+			// plain `git fetch <arbiter>` + `rev-parse <arbiter>/main`. In the
+			// bare-hub-mirror job worktree `--isolated` runs in, that fetch does not
+			// populate `refs/remotes/<arbiter>/main` at all (the mirror refspec maps
+			// `+refs/heads/*:refs/heads/*`) and can even fail outright, so the verify
+			// compared our fresh sha against a view PREDATING our own push and declared
+			// a landed transition "not our commit ⇒ rejected" — five times per bounce,
+			// landing five identical commits and then reporting "did not land"
+			// (observation `checkpoint-path-reports-its-own-write-as-absent`). We now
+			// prune-fetch with the EXPLICIT refspec (so the objects/refs are local for
+			// any follow-up comparison) and then ask the ARBITER for the sha via
+			// `ls-remote`, which no local refspec accident can defeat.
+			await refreshArbiterRefs({cwd, arbiter, branches: ['main'], env});
+			const resolved = await resolveArbiterBranch({
+				cwd,
+				arbiter,
+				branch: 'main',
+				env,
+			});
+			if (resolved.sha === nonced) {
 				return {
 					kind: 'published',
 					message: 'transition published',
+					publishedHead: nonced,
+				};
+			}
+			if (!resolved.trustworthy) {
+				// The arbiter could not be reached, so we CANNOT tell a lost CAS from an
+				// unreadable view — and our push exited 0, which is evidence FOR landing.
+				// Reporting "rejected" here is precisely the defect (a successful write
+				// described as absent), and it also drives a retry that would duplicate
+				// the commit. Trust the green push: report published, and say why.
+				emit(
+					`push to ${arbiter}/main succeeded but the arbiter could not be re-read ` +
+						`to confirm it (${resolved.unreachableDetail ?? 'arbiter unreachable'}) ` +
+						'— trusting the successful push rather than reporting a landed write as ' +
+						'absent.',
+				);
+				return {
+					kind: 'published',
+					message:
+						'transition published (push succeeded; arbiter re-read unavailable)',
 					publishedHead: nonced,
 				};
 			}

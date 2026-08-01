@@ -18,6 +18,7 @@ import {
 	isolatePiAgentDir,
 	seedRepoWithArbiter,
 	existsOnArbiterMain,
+	pathOnArbiterMain,
 	gitEnv,
 	gitIn,
 	type Scratch,
@@ -288,10 +289,10 @@ describe('advanceRegistrySetRunTick — a gate flip makes plain `run` perform th
 
 describe('advanceRegistrySetRunTick — no regression in needs-attention routing', () => {
 	it(
-		'a failing build routes to needs-attention; the loop survives and keeps ticking',
+		'a failing build is SURFACED for a human; the loop survives and keeps ticking',
 		{timeout: 30000},
 		async () => {
-			seedAndRegister('fail', ['willfail']);
+			const {seed} = seedAndRegister('fail', ['willfail']);
 			const failingAgent: DoDorfl = () => ({
 				ok: false,
 				detail: 'the agent failed to build',
@@ -305,12 +306,30 @@ describe('advanceRegistrySetRunTick — no regression in needs-attention routing
 				env: gitEnv(),
 			});
 
-			// The failing build is routed to needs-attention and counted as failed; the
-			// loop ran its tick and ended cleanly (no crash).
+			// The loop ran its tick and ended cleanly (no crash) — the invariant this
+			// test exists for.
 			expect(summary.iterations).toBe(1);
-			expect(summary.claimedAndDone).toBe(0);
-			expect(summary.needsAttention).toBe(1);
-			expect(summary.failed).toBe(1);
+
+			// The failing build is SURFACED (a `stuck`-kind sidecar + `needsAnswers:true`
+			// on the item, then the lock released) and that CLEAN surface is GREEN — the
+			// PR-2b D3 semantics `saveAgentFailure` already encodes (`exitCode: routed.moved
+			// ? 0 : 1`): the item was successfully parked for a human, which is a completed
+			// advance, not a failure of the runner.
+			//
+			// These counts were INVERTED before the Defect-1 fix (observation
+			// `checkpoint-path-reports-its-own-write-as-absent`): the surface commit landed
+			// on `main`, but the post-write verification read a view predating its own push
+			// and reported `moved: false`, so the bounce looked like a FAILED surface
+			// (`exitCode: 1` ⇒ `needsAttention: 1`) and the lock was never released. The
+			// surface working correctly is what moves these numbers.
+			expect(summary.claimedAndDone).toBe(1);
+			expect(summary.needsAttention).toBe(0);
+			expect(summary.failed).toBe(0);
+
+			// The routing genuinely happened: the human-facing question is on the arbiter.
+			expect(
+				pathOnArbiterMain(seed.repo, 'work/questions/task-willfail.md'),
+			).toBe(true);
 		},
 	);
 });

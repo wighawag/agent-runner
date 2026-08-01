@@ -24,8 +24,10 @@ import {
 } from './item-lock.js';
 import {ledgerWrite, type LedgerTransitionKind} from './ledger-write.js';
 import {workBranchRef} from './slug-namespace.js';
+import {refreshArbiterRefs, resolveArbiterBranch} from './arbiter-refs.js';
 import {
 	appendQuestions,
+	isEntryAnswered,
 	newSidecar,
 	parseSidecar,
 	resolveSidecarIdentity,
@@ -247,6 +249,50 @@ export interface ReturnToBacklogResult {
 	reconciled?: boolean;
 	/** When NOT moved, why (e.g. the slug held no recoverable per-item lock on the arbiter, or a failed --reset delete). */
 	reasonNotMoved?: string;
+	/**
+	 * **The ONE resolved continue-branch state** this requeue decided from — so a
+	 * CALLER reports the same reality the requeue acted on instead of running its
+	 * own second probe (observation
+	 * `checkpoint-path-reports-its-own-write-as-absent`).
+	 *
+	 * The deadline checkpoint used to print two lines from two independent probes
+	 * that disagreed inside the same second: `returnToBacklog` said "'<slug>' has no
+	 * work branch on origin — nothing to continue from", and the caller then said
+	 * "the next tick continues from work/task-<slug>". Both cannot be true, and
+	 * acting on the first one discards the branch's work. Publishing the resolved
+	 * state here removes the second probe entirely: there is one answer, and every
+	 * message is derived from it.
+	 *
+	 * Absent only when no continue-branch question was asked (the `--reset` path,
+	 * which discards the branch by design, or an early refusal).
+	 */
+	continueBranch?: ResolvedContinueBranch;
+}
+
+/**
+ * The resolved state of the kept `work/<slug>` continue-branch on the arbiter, as
+ * decided ONCE by {@link returnToBacklog} (see
+ * {@link ReturnToBacklogResult.continueBranch}).
+ */
+export interface ResolvedContinueBranch {
+	/** The unqualified branch name (e.g. `work/task-<slug>`). */
+	branch: string;
+	/** True iff the arbiter HAS this branch (arbiter-authoritative `ls-remote`). */
+	present: boolean;
+	/** Its tip sha on the arbiter, when present. */
+	sha?: string;
+	/**
+	 * True iff the branch is present AND carries commits `<arbiter>/main` lacks —
+	 * i.e. there IS work to continue from. False when absent, or present but fully
+	 * merged (nothing to resume).
+	 */
+	aheadOfMain: boolean;
+	/**
+	 * False when the arbiter could not be reached, so {@link present} is a
+	 * stale-capable local read. A caller MUST NOT report "nothing to continue from"
+	 * off an untrustworthy read — that is exactly the defect.
+	 */
+	trustworthy: boolean;
 }
 
 export interface SurfaceToNeedsAttentionOptions {
@@ -591,7 +637,23 @@ export async function returnToBacklog(
 	// Refresh the remote-tracking refs so every check below (the item's residence,
 	// the continue-branch guard, the CAS base) sees the arbiter's TRUTH, not a stale
 	// local copy. This is a fetch, not a checkout — the working tree is untouched.
-	await gitSoftAsync(['fetch', '--quiet', arbiter], cwd, env);
+	//
+	// This used to be a PLAIN `git fetch <arbiter>`, which is precisely how the
+	// deadline checkpoint came to announce "no work branch on origin" over a branch
+	// holding an hour of work: in the bare-hub-mirror job worktree an `--isolated`
+	// run uses, that fetch does not populate `refs/remotes/<arbiter>/*` (the mirror
+	// refspec maps `+refs/heads/*:refs/heads/*`) and in fact FAILS outright
+	// (`refusing to fetch into branch 'refs/heads/work/<slug>' checked out at …`),
+	// so it refreshed nothing and the guard below read a ref that never existed.
+	// The shared helper prune-fetches per branch with the EXPLICIT destination
+	// refspec, tolerating that one refusal instead of being defeated by it.
+	const continueBranchName = workBranchRef('task', slug);
+	await refreshArbiterRefs({
+		cwd,
+		arbiter,
+		branches: ['main', continueBranchName],
+		env,
+	});
 
 	// Is the item LOCK-HELD on the arbiter? (task
 	// `cutover-needs-attention-becomes-lock-stuck-recovery-surface`, decision i+:
@@ -729,8 +791,34 @@ export async function returnToBacklog(
 	// in `isolation.ts`. We check the ARBITER ref (already fetched above), NOT the
 	// local `work/<slug>` (which SURVIVES a failed push). NOT on `--reset` (which
 	// discards the branch by design).
+	let continueBranch: ResolvedContinueBranch | undefined;
 	if (!options.reset) {
-		const branch = workBranchRef('task', slug);
+		const branch = continueBranchName;
+		// Resolve the continue-branch state EXACTLY ONCE, ARBITER-AUTHORITATIVELY, and
+		// reuse that single answer for the guard decision, the note, AND the caller's
+		// report (`result.continueBranch`). Previously this read the local tracking ref
+		// `<arbiter>/work/<slug>` — a ref the bare-mirror job worktree never has — so
+		// it answered "absent" for a branch that was sitting on the arbiter, and the
+		// caller's own separate probe then contradicted it in the very next line.
+		const resolved = await resolveArbiterBranch({cwd, arbiter, branch, env});
+		const present = resolved.sha !== undefined;
+		// AHEAD-of-main only makes sense when the branch is present. `refreshArbiterRefs`
+		// above put the objects + tracking ref in place, so the comparison is local;
+		// fall back to the arbiter-reported sha when the tracking ref is still missing
+		// (e.g. the refspec git refused because the branch is checked out HERE — in
+		// which case the local head of the same name IS the branch).
+		const aheadOfMain = present
+			? branchAheadOf(cwd, `${arbiter}/${branch}`, `${arbiter}/main`, env) ||
+				branchAheadOf(cwd, resolved.sha!, `${arbiter}/main`, env)
+			: false;
+		continueBranch = {
+			branch,
+			present,
+			...(resolved.sha !== undefined ? {sha: resolved.sha} : {}),
+			aheadOfMain,
+			trustworthy: resolved.trustworthy,
+		};
+
 		// Split the guard into TWO cases (task
 		// `default-requeue-succeeds-when-no-work-branch-exists`):
 		//   (a) the arbiter branch does NOT EXIST at all (never pushed, or a prior
@@ -743,33 +831,29 @@ export async function returnToBacklog(
 		//   (b) the arbiter branch EXISTS but is NOT ahead of `<arbiter>/main` — a
 		//       real anomaly (the continue-branch would resume from a state already
 		//       reachable from main). Preserve today's refusal so the case surfaces.
-		const tip = gitSoftRun(
-			['rev-parse', '--verify', '--quiet', `${arbiter}/${branch}^{commit}`],
-			cwd,
-			env,
-		);
-		const arbiterBranchExists = tip.status === 0 && tip.stdout.trim() !== '';
-		if (!arbiterBranchExists) {
+		if (!present) {
+			// Say "nothing to continue from" ONLY off a read the arbiter actually
+			// answered. On an unreachable arbiter we cannot know, and claiming a branch
+			// is absent is the dangerous direction (an operator or wrapper acting on it
+			// re-drives the task from scratch and discards the saved work).
 			note(
-				`'${slug}' has no work branch on ${arbiter} — requeueing to backlog ` +
-					'for a FRESH claim (nothing to continue from; no --reset needed).',
+				resolved.trustworthy
+					? `'${slug}' has no work branch on ${arbiter} — requeueing to backlog ` +
+							'for a FRESH claim (nothing to continue from; no --reset needed).'
+					: `'${slug}': could not read ${arbiter} to tell whether a work branch ` +
+							`exists (${resolved.unreachableDetail ?? 'arbiter unreachable'}) — ` +
+							'requeueing to backlog WITHOUT asserting there is nothing to ' +
+							'continue from. Do NOT re-drive from scratch until the branch has ' +
+							'been checked.',
 			);
-		} else {
-			const onArbiter = branchAheadOf(
-				cwd,
-				`${arbiter}/${branch}`,
-				`${arbiter}/main`,
-				env,
-			);
-			if (!onArbiter) {
-				const message =
-					`the work branch ${branch} isn't on ${arbiter} (the continue ` +
-					`branch a cross-machine worker would resume from) — push it first, or ` +
-					'`requeue --reset` to discard and start fresh. Item left stuck (lock not ' +
-					'released).';
-				note(message);
-				return {moved: false, reasonNotMoved: message};
-			}
+		} else if (!aheadOfMain) {
+			const message =
+				`the work branch ${branch} isn't on ${arbiter} (the continue ` +
+				`branch a cross-machine worker would resume from) — push it first, or ` +
+				'`requeue --reset` to discard and start fresh. Item left stuck (lock not ' +
+				'released).';
+			note(message);
+			return {moved: false, reasonNotMoved: message, continueBranch};
 		}
 	}
 
@@ -856,12 +940,23 @@ export async function returnToBacklog(
 			`requeue for '${slug}': could not release the per-item lock ` +
 			`(${released.message}). The item is left stuck. Try again shortly.`;
 		note(message);
-		return {moved: false, reasonNotMoved: message};
+		return {moved: false, reasonNotMoved: message, continueBranch};
 	}
+	// Derive the closing line from the SAME resolved state the guard used, so this
+	// note can never contradict the one above it.
 	note(
-		`Returned '${slug}' to backlog (released the lock; body rests in pool).`,
+		`Returned '${slug}' to backlog (released the lock; body rests in pool)` +
+			(continueBranch?.aheadOfMain === true
+				? `; the next claim continues from ${continueBranch.branch}.`
+				: '.'),
 	);
-	return {moved: true, commitMessage, deletedRemoteBranch, reconciled};
+	return {
+		moved: true,
+		commitMessage,
+		deletedRemoteBranch,
+		reconciled,
+		continueBranch,
+	};
 }
 
 /**
@@ -1528,18 +1623,22 @@ async function runTreelessLedgerMove(params: {
 		env,
 		note,
 	} = params;
-	const fetchArgs = explicitMainRefspec
-		? [
-				'fetch',
-				'--quiet',
-				arbiter,
-				`+refs/heads/main:refs/remotes/${arbiter}/main`,
-			]
-		: ['fetch', '--quiet', arbiter];
+	// `explicitMainRefspec` is now VESTIGIAL: the shared refresh below always uses
+	// the explicit per-branch refspec, because the plain `git fetch <arbiter>` the
+	// `false` case used is exactly what made the surface path read a view PREDATING
+	// its own write (and, in a bare-mirror job worktree, fail outright) — see
+	// `arbiter-refs.ts` and observation
+	// `checkpoint-path-reports-its-own-write-as-absent`. It is kept in the signature
+	// only so the two call sites stay explicit about which direction they are; the
+	// requeue direction refreshes its OTHER refs (the continue-branch guard) itself.
+	void explicitMainRefspec;
+	const refreshMain = async (): Promise<void> => {
+		await refreshArbiterRefs({cwd, arbiter, branches: ['main'], env});
+	};
 
 	for (let i = 0; i < TREELESS_CONTENTION_ATTEMPTS; i++) {
 		if (i > 0) {
-			await gitSoftAsync(fetchArgs, cwd, env);
+			await refreshMain();
 		}
 		const base = (
 			await gitHardAsync(['rev-parse', `${arbiter}/main`], cwd, env)
@@ -1554,6 +1653,24 @@ async function runTreelessLedgerMove(params: {
 		}
 		if (prepared === 'missing') {
 			return false;
+		}
+
+		// COMMIT-LEVEL IDEMPOTENCE (observation
+		// `checkpoint-path-reports-its-own-write-as-absent`): if the planned commit's
+		// TREE is identical to the base's, this transition has NOTHING to write —
+		// whatever it wanted to say is already on `main`. Publishing it anyway appends
+		// an empty commit, which is how one bounce turned into five identical commits
+		// (the retry budget, not anything real, set the commit count). An empty diff is
+		// the DESIRED end state, so report landed and push nothing.
+		const baseTree = (
+			await gitHardAsync(['rev-parse', `${base}^{tree}`], cwd, env)
+		).stdout.trim();
+		const preparedTree = (
+			await gitHardAsync(['rev-parse', `${prepared.commit}^{tree}`], cwd, env)
+		).stdout.trim();
+		if (preparedTree === baseTree) {
+			await gitSoftAsync(['update-ref', '-d', prepared.ref], cwd, env);
+			return true;
 		}
 
 		// Publish THROUGH the shared seam (the same `:main` push + force-with-lease +
@@ -1575,7 +1692,7 @@ async function runTreelessLedgerMove(params: {
 		if (result.kind === 'published') {
 			// Advance the LOCAL remote-tracking `<arbiter>/main` so it INCLUDES the
 			// move (the push only moved the arbiter's main). Best-effort.
-			await gitSoftAsync(fetchArgs, cwd, env);
+			await refreshMain();
 			return true;
 		}
 		// rejected: main moved under us — refetch + REPLAN against the new base.
@@ -1673,6 +1790,105 @@ function prepareTreelessMoveCommit(params: {
 		return {ref, commit};
 	} finally {
 		rmSync(scratchIndex, {force: true});
+	}
+}
+
+/**
+ * Build the ENGINE-AUTHORED envelope entry for a bounce — the one entry every
+ * bounce always surfaces, so a reason-only bounce still leaves exactly one
+ * human-answerable question.
+ *
+ * Callers may OVERRIDE it (e.g. the empty-diff path swaps in a dispose-defaulted
+ * question); the override still defaults `kind` to `stuck` and `context` to the
+ * bounce reason when it leaves them unset (so a caller can restate the reason in
+ * the envelope prose without duplicating it in `context`).
+ *
+ * Extracted from {@link prepareTreelessSurfaceCommit} so the idempotence probe
+ * ({@link bounceAlreadySurfaced}) compares against the EXACT entry the surface
+ * would write. If the two ever derived the envelope independently they could
+ * drift, and the de-duplication would silently stop de-duplicating — which is
+ * the whole defect it exists to prevent.
+ */
+function buildBounceEnvelope(params: {
+	item: string;
+	reason: string;
+	envelope?: NewQuestion;
+}): NewQuestion {
+	const {item, reason, envelope: override} = params;
+	if (override) {
+		return {
+			kind: override.kind ?? 'stuck',
+			question: override.question,
+			context: override.context ?? reason,
+			...(override.default !== undefined ? {default: override.default} : {}),
+		};
+	}
+	return {
+		question: `'${item}' was bounced — how should we proceed?`,
+		context: reason,
+		kind: 'stuck',
+	};
+}
+
+/**
+ * Is this EXACT bounce already surfaced (and still awaiting a human) on `base`?
+ *
+ * The surface-level half of the idempotence fix (observation
+ * `checkpoint-path-reports-its-own-write-as-absent`): the generic empty-tree
+ * short-circuit in {@link runTreelessLedgerMove} cannot catch a re-surface,
+ * because {@link appendQuestions} always mints a NEW entry id — so re-running a
+ * surface that already landed produced a genuinely different tree, and therefore
+ * an additional commit. Five retries ⇒ five commits, i.e. the commit count scaled
+ * with the retry budget rather than with anything real.
+ *
+ * "Already surfaced" is defined narrowly and precisely: the item body already
+ * carries `needsAnswers: true` AND **every** entry this surface would append (the
+ * engine envelope plus any agent-surfaced questions) is ALREADY present as an
+ * UNANSWERED entry with the same `question` + `context`. Each clause matters:
+ *
+ *   - Requiring `needsAnswers: true` keeps the `needsAnswers ⟺ sidecar` invariant
+ *     intact: if the flag is somehow missing, we still write (and repair it).
+ *   - Requiring EVERY addition to be present means a bounce carrying NEW
+ *     agent-surfaced questions is never swallowed just because its envelope
+ *     matches. Partial overlap writes; only a TOTAL match is a no-op.
+ *   - Requiring the matching entries to be UNANSWERED keeps this a
+ *     de-duplication rather than a swallow. A human who ANSWERED this exact
+ *     question and let the work resume MUST be told again when the same failure
+ *     recurs — that is a NEW bounce, and it surfaces normally. Only identical,
+ *     still-pending questions are suppressed, and a duplicate of a question
+ *     nobody has answered yet adds noise, never information.
+ */
+function bounceAlreadySurfaced(params: {
+	base: string;
+	itemPath: string;
+	sidecarPath: string;
+	/** Every entry the surface would append (envelope first, then agent questions). */
+	additions: readonly NewQuestion[];
+	cwd: string;
+	env: NodeJS.ProcessEnv | undefined;
+}): boolean {
+	const {base, itemPath, sidecarPath, additions, cwd, env} = params;
+	if (!pathInCommit(base, sidecarPath, cwd, env)) {
+		return false;
+	}
+	try {
+		const body = catBlob(`${base}:${itemPath}`, cwd, env);
+		if (parseFrontmatter(body).needsAnswers !== true) {
+			return false;
+		}
+		const model = parseSidecar(catBlob(`${base}:${sidecarPath}`, cwd, env));
+		const pending = model.entries.filter((entry) => !isEntryAnswered(entry));
+		return additions.every((addition) =>
+			pending.some(
+				(entry) =>
+					entry.question === addition.question &&
+					entry.context === (addition.context ?? ''),
+			),
+		);
+	} catch {
+		// Unreadable body/sidecar ⇒ do NOT claim it is already surfaced; fall through
+		// and let the normal surface path run (the safe direction: record the bounce).
+		return false;
 	}
 }
 
@@ -1809,25 +2025,12 @@ export function prepareTreelessSurfaceCommit(params: {
 
 	// Compose the entries: an engine-authored envelope carrying the reason, then
 	// any agent-surfaced questions (stamped `stuck`-kind if the caller left the
-	// kind unset — this IS the stuck-surface path). Callers may OVERRIDE the
-	// envelope (e.g. the empty-diff path swaps in a dispose-defaulted question);
-	// the override still defaults `kind` to `stuck` and `context` to the bounce
-	// reason when the override leaves them unset (the caller can restate the
-	// reason in the envelope prose without duplicating it in `context`).
-	const envelope: NewQuestion = envelopeOverride
-		? {
-				kind: envelopeOverride.kind ?? 'stuck',
-				question: envelopeOverride.question,
-				context: envelopeOverride.context ?? reason,
-				...(envelopeOverride.default !== undefined
-					? {default: envelopeOverride.default}
-					: {}),
-			}
-		: {
-				question: `'${item}' was bounced — how should we proceed?`,
-				context: reason,
-				kind: 'stuck',
-			};
+	// kind unset — this IS the stuck-surface path).
+	const envelope = buildBounceEnvelope({
+		item,
+		reason,
+		envelope: envelopeOverride,
+	});
 	const surfaced: NewQuestion[] = (questions ?? []).map((q) => ({
 		...q,
 		kind: q.kind ?? 'stuck',
@@ -2022,6 +2225,26 @@ export async function surfaceStuckToNeedsAttention(
 		plan: (base) => {
 			if (!pathInCommit(base, resolvedItemPath, cwd, env)) {
 				return 'missing';
+			}
+			// IDEMPOTENCE: this exact bounce may ALREADY be surfaced on this base —
+			// either a genuine re-bounce for an identical, still-pending reason, or a
+			// retry of an attempt that landed but was mis-read as rejected. Either way
+			// there is nothing to add, so land no commit (see
+			// {@link bounceAlreadySurfaced}).
+			if (
+				bounceAlreadySurfaced({
+					base,
+					itemPath: resolvedItemPath,
+					sidecarPath: sidecarPathFor(item),
+					additions: [
+						buildBounceEnvelope({item, reason, envelope}),
+						...(questions ?? []),
+					],
+					cwd,
+					env,
+				})
+			) {
+				return 'already-done';
 			}
 			return prepareTreelessSurfaceCommit({
 				cwd,

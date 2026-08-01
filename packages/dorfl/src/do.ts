@@ -2057,10 +2057,27 @@ async function routeDeadlineCheckpoint(params: {
 			note,
 		});
 		if (returned.moved) {
+			// Derive this line from the SINGLE state `returnToBacklog` resolved, never
+			// from an independent assumption. It used to assert "the next tick continues
+			// from <branch>" unconditionally, which contradicted the requeue's own
+			// "'<slug>' has no work branch on <arbiter> — nothing to continue from" line
+			// emitted two lines earlier. Both cannot be true, and acting on the wrong one
+			// re-drives the task from scratch and discards the saved work (observation
+			// `checkpoint-path-reports-its-own-write-as-absent`). One resolved state, one
+			// story: mutually contradictory lines are worse than emitting nothing.
+			const continueFrom = returned.continueBranch;
+			const continuation =
+				continueFrom === undefined || continueFrom.aheadOfMain
+					? `lock released so the next tick continues from ${continueFrom?.branch ?? branch}`
+					: continueFrom.trustworthy
+						? 'lock released; the arbiter has no work to continue from, so the next ' +
+							'tick starts this item fresh'
+						: `lock released; the arbiter could not be read to confirm ${continueFrom.branch}, ` +
+							'so do NOT assume the work is gone — check the branch before re-driving';
 			const message =
 				`Auto-continued '${slug}' at the dorfl-internal deadline (checkpoint ` +
 				`${checkpointCount}/${maxAutoCheckpoints}): WIP saved + branch pushed, ` +
-				`lock released so the next tick continues from ${branch}. ${reason}`;
+				`${continuation}. ${reason}`;
 			note(message);
 			return {
 				exitCode: 0,

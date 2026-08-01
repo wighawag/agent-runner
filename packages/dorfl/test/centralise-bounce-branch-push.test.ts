@@ -7,7 +7,7 @@ import {performStart} from '../src/start.js';
 import {performComplete} from '../src/complete.js';
 import {performClaim} from '../src/claim-cas.js';
 import {returnToBacklog} from '../src/needs-attention.js';
-import {markStuckItemLock} from '../src/item-lock.js';
+import {markStuckItemLock, readItemLock} from '../src/item-lock.js';
 import {scanRepoPaths} from '../src/scan.js';
 import {jobWorktreePath} from '../src/workspace.js';
 import {mergeConfig} from '../src/config.js';
@@ -296,17 +296,38 @@ describe('run agent-failure is SAVED + cross-machine recoverable (the fifth gap)
 		expect(sidecarSurfacedOnArbiterMain(seeded.repo, 'alpha')).toBe(true);
 		expect(needsAnswersOnArbiterMain(seeded.repo, 'alpha')).toBe(true);
 
-		// A human requeues (default keep + continue): releases the stuck lock.
+		// The bounce ALREADY released the lock (PR-2b: surface-FIRST, release-SECOND),
+		// so the item is at rest in the pool carrying `needsAnswers: true` and there is
+		// nothing for `requeue` to recover. It must therefore REFUSE, honestly.
+		//
+		// This assertion was INVERTED before the Defect-1 fix (observation
+		// `checkpoint-path-reports-its-own-write-as-absent`), and the reason is worth
+		// recording: the surface commit did land on `main` (the two assertions above
+		// prove it), but the post-write verification read a view predating its own push
+		// and reported `surfaced: false` — so the release-second step never ran and the
+		// lock was left `state: active` FOREVER. The item was simultaneously surfaced
+		// for a human AND still holding a live claim, which is why `requeue` used to
+		// find a lock to release here. That stranded lock was a third consequence of
+		// the same defect, and it is now gone.
 		const human = seeded.clone('requeuer');
 		gitIn(['fetch', '-q', ARBITER], human);
 		gitIn(['checkout', '-q', '-B', 'main', `${ARBITER}/main`], human);
+		expect(
+			await readItemLock({
+				item: 'task:alpha',
+				cwd: human,
+				arbiter: ARBITER,
+				env: gitEnv(),
+			}),
+		).toBeUndefined();
 		const requeued = await returnToBacklog({
 			cwd: human,
 			slug: 'alpha',
 			arbiter: ARBITER,
 			env: gitEnv(),
 		});
-		expect(requeued.moved).toBe(true);
+		expect(requeued.moved).toBe(false);
+		expect(requeued.reasonNotMoved).toMatch(/no held per-item lock/);
 
 		// A DIFFERENT machine (a fresh clone) re-claims via start → CONTINUES from the
 		// pushed branch, so the failed agent's partial work is present.
