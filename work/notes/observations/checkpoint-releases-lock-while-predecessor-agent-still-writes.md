@@ -1,5 +1,5 @@
 ---
-needsAnswers: false
+needsAnswers: true
 ---
 
 # After a deadline checkpoint, TWO agents were alive in the same worktree at once
