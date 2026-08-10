@@ -1,5 +1,35 @@
 # dorfl
 
+## 0.11.3
+
+### Patch Changes
+
+- 72963e1: Fix `dorfl gc --ledger` reporting locks that do not exist on the arbiter.
+
+  `gc --ledger` reported "STALE / crash-window orphan" locks and printed a `dorfl release-lock <item>` for each, which then failed with "(stale info)" / "already absent on origin" — naming locks a human should delete that did not actually exist. Verified: `git ls-remote origin 'refs/dorfl/lock/*'` returned nothing while the hub mirror held 8 `refs/dorfl/lock/*` refs, three of them for locks released on origin earlier in the same session.
+
+  The root cause was structural. The lock readers (`listItemLocks`, `listItemLockEntries`, `readItemLock`, `fetchHeldEntry`, the acquire/release/reconcile paths) did `git fetch <arbiter> +refs/dorfl/lock/*:refs/dorfl/lock/*` — force-update with NO `--prune` — then read the LOCAL `refs/dorfl/lock/*` via `for-each-ref` / `git show <ref>`. A lock released on the arbiter (its ref deleted there) survived locally indefinitely, so the readers reported locks the arbiter no longer held. The same accumulation also affected the SELECTION path (`heldTaskSlugsStrict`/`heldSpecSlugsStrict` via `listItemLocks`): a released task's stale local ref kept it subtracted from the eligible pool, so a released task could not be re-tasked. Separately, `ensureMirror` synced only `refs/heads/*` (and `main`), never `refs/dorfl/lock/*`, so the mirror's lock namespace was never pruned and released locks accumulated there too.
+
+  Two fixes:
+  1. Prune `refs/dorfl/lock/*` when syncing the mirror. `ensureMirror` now best-effort `--prune` fetches the per-item lock namespace from the arbiter, so released locks cannot accumulate on the mirror.
+  2. The ledger reads the arbiter directly. `listItemLockEntries` (the `gc --ledger` report reader) now takes the authoritative lock list from `git ls-remote <arbiter> refs/dorfl/lock/*` — ONLY the refs that actually exist on the arbiter right now — so the report can never name a lock that does not exist. The content is materialized by a `--prune` fetch (which also keeps the local namespace clean). `listItemLocks`, `readItemLock`, `fetchHeldEntry`, and the acquire/release/reconcile fetches all add `--prune`, so a released lock's stale local ref is pruned and `for-each-ref`/`git show` read the arbiter's actual state. `listItemLocks` keeps materializing the refs locally (not `ls-remote`-only) because `migrateStuckLocks` reads a lock's body via `git show <ref>:lock.md` after it.
+
+  A report whose entire purpose is to name locks a human should delete can no longer name locks that do not exist. Adds regression tests: a mirror holding a lock ref the arbiter does not is pruned on the next `ensureMirror` sync; and `listItemLocks`/`listItemLockEntries`/`reportItemLocks`/`readItemLock` do not report a stale local lock ref the arbiter no longer holds (while a genuinely held lock is still reported).
+
+- b2576c0: Fix the tasker-review leg crashing `dorfl do spec:<slug>` on any large spec.
+
+  Running `dorfl do spec:<slug> --isolated --propose` on a substantial spec printed `review agent produced no parseable {verdict, findings} result` and died — no task branch, no PR, nothing emitted — leaving the tasking lock held (cleared only by hand via `dorfl release-lock`) and writing no `work/questions/spec-<slug>.md` sidecar. It was deterministic, not a flaky model: the tasker itself produced a good decomposition, but the review leg failed and the whole run was discarded with it.
+
+  The root cause was structural and upstream of the parser. `verdictContractPrompt` asked the review agent to emit the FULL replacement body of every edited task file inline as `edits: [{path, content: "<full replacement>"}]` in the SAME single JSON object as the verdict — an unbounded payload sharing one capped model response with the verdict. The richer the spec, the more edit body bytes, the more certain the response cap-truncated mid-object before the verdict closed. `extractJsonObjectSpan` then returned `undefined`, `parseReviewVerdict` threw, and the throw propagated out of `performTask` (there was no try/catch around the review loop). The parser was correct to refuse to invent a verdict and is left unchanged.
+
+  Four fixes, in priority order:
+  1. The unbounded full-file `edits` payload is moved off the capped response. The review agent now WRITES each edited task body to a scratch file under `work/tasks/.review-edits/` and references it by `src` in the verdict JSON (a new optional `TaskEdit.src` channel; inline `content` is kept as the legacy small-edit form). The verdict JSON now carries only paths, so its size is bounded by the NUMBER of edits, not the total body size — a large decomposition can no longer cap-truncate the verdict. The runner reads the scratch body, applies it through the SAME scope fence (unchanged), and reaps the scratch so the integrate's `git add -A` never sweeps it. Because the agent writes to scratch (not the target), the tasker's pristine candidate tasks stay untouched until the verdict parses.
+  2. Cap-truncation is now detected and NAMED at the harness seam. `LaunchResult` carries a new `outputCapped` signal (the observed `usage.output` token count), populated by the pi adapter from the session log's last assistant turn's `stop_reason` (`null`/`None`/`max_tokens`) + `usage.output`. When a parse fails AND that signal is present, the gate throws the new `ReviewOutputCappedError` ("review agent output hit the model output cap (16384 tokens) and was truncated before emitting its verdict") instead of the generic parse error — so an operator no longer mis-reads it as a flake and retries blindly, burning a second full tasking run. A verdict that DID close on a capped turn is still honored. When the adapter cannot see the signal (the null/shell adapter), the parse still fails as a generic `ReviewParseError` — still needs-attention, never a silent approve.
+  3. The tasker's work is no longer discarded on this path. `performTask` catches the review failure and `persistTaskingCandidates` commits the candidate tasks to the work branch (`work/spec-<slug>`) with a marker commit and pushes best-effort, so a retry or a human can recover them.
+  4. The lock is released and the documented bounce completed. The catch routes through the existing `surfaceTaskingBlock` (release the tasking lock + write the `work/questions/spec-<slug>.md` sidecar), identical to the decomposition-unclear path — the lock is released and the sidecar written, honouring the WORK-CONTRACT end-of-leg release on success OR bounce.
+
+  `ReviewOutputCappedError` subclasses `ReviewParseError` so every existing `catch (ReviewParseError)` site routes it to needs-attention uniformly — a parse failure is never turned into a silent approve, and the narrow control-character repair pass in `parseReviewVerdict` is left exactly as narrow as it was. Adds regression tests driving the tasker-review gate with a response truncated at the output cap (asserting the named failure + lock release + candidate-task persistence) and a non-review throw is re-thrown.
+
 ## 0.11.2
 
 ### Patch Changes
