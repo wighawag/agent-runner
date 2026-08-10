@@ -7,12 +7,15 @@ import {
 	releaseHeldItemLock,
 	markStuckItemLock,
 	listItemLocks,
+	listItemLockEntries,
+	readItemLock,
 	reportItemLocks,
 	formatItemLockReport,
 	itemLockReportNeedsAttention,
 	classifyItemLockAgainstMain,
 	itemFromLockEntry,
 	itemLockRef,
+	lockEntryFor,
 } from '../src/item-lock.js';
 import {
 	makeScratch,
@@ -457,5 +460,127 @@ describe('vanished-own-lock — a held runner detects the missing ref and aborts
 		});
 		expect(rel.outcome).toBe('released');
 		expect(lockRefOnArbiter(arbiter, 'task-cleanfinish')).toBe(false);
+	});
+});
+
+// --- gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state ----------------
+//
+// Regression: `listItemLocks`/`listItemLockEntries`/`reportItemLocks` used to
+// `git fetch +refs/dorfl/lock/*:refs/dorfl/lock/*` (force, NO --prune) then read
+// the LOCAL `refs/dorfl/lock/*` via `for-each-ref`. A lock RELEASED on the
+// arbiter (its ref deleted there) survived locally indefinitely, so the ledger
+// reported locks that did not exist on the arbiter — and printed a
+// `release-lock <item>` for each, which then failed with "(stale info)" /
+// "already absent on origin". A report whose purpose is to name locks a human
+// should delete must not name locks that do not exist. The readers now read the
+// arbiter DIRECTLY via `ls-remote` (the authoritative set), so a stale local
+// ref can never be reported.
+
+describe('gc --ledger — never reports a stale local lock ref the arbiter no longer holds', () => {
+	/** Plant a STALE local `refs/dorfl/lock/<entry>` ref the arbiter no longer holds. */
+	async function plantStaleLocalLockRef(
+		repo: string,
+		arbiter: string,
+		item: string,
+	): Promise<void> {
+		// Acquire the lock on the arbiter (the real ref lands on the arbiter).
+		const acq = await acquireItemLock({
+			item,
+			action: 'implement',
+			cwd: repo,
+			arbiter: ARBITER,
+			env: gitEnv(),
+		});
+		expect(acq.outcome).toBe('acquired');
+		// Fetch the lock ref into the repo's LOCAL refs (the accumulated state a
+		// pre-fix unpruned sync left behind).
+		run(
+			'git',
+			['fetch', '-q', ARBITER, '+refs/dorfl/lock/*:refs/dorfl/lock/*'],
+			repo,
+			{env: gitEnv()},
+		);
+		// Delete the ref on the ARBITER ONLY (simulate a release that happened on
+		// the arbiter — e.g. on another machine, or earlier in the session — but
+		// never pruned the local/mirror ref).
+		run(
+			'git',
+			['push', '-q', ARBITER, `:refs/dorfl/lock/${lockEntryFor(item)}`],
+			repo,
+			{
+				env: gitEnv(),
+			},
+		);
+	}
+
+	it('listItemLocks reads the arbiter DIRECTLY (ls-remote) — a stale local ref is NOT listed', async () => {
+		const {repo, arbiter} = seedRepoWithArbiter(scratch.root, ['ghost']);
+		await plantStaleLocalLockRef(repo, arbiter, 'task:ghost');
+		// The arbiter no longer holds the lock ...
+		expect(lockRefOnArbiter(arbiter, 'task-ghost')).toBe(false);
+		// ... but the repo's LOCAL ref is still there (the accumulated stale state).
+		const localRef = run(
+			'git',
+			['rev-parse', '--verify', '--quiet', 'refs/dorfl/lock/task-ghost'],
+			repo,
+			{env: gitEnv()},
+		);
+		expect(localRef.status).toBe(0);
+		// listItemLocks reads the arbiter DIRECTLY → the stale local ref is NOT listed.
+		expect(await listItemLocks(repo, ARBITER, gitEnv())).toEqual([]);
+	});
+
+	it('listItemLockEntries + reportItemLocks do NOT name the stale lock (the report must not name locks that do not exist)', async () => {
+		const {repo, arbiter} = seedRepoWithArbiter(scratch.root, ['ghost']);
+		await plantStaleLocalLockRef(repo, arbiter, 'task:ghost');
+		expect(lockRefOnArbiter(arbiter, 'task-ghost')).toBe(false);
+		// The full-entry reader returns NO entry for the stale ref.
+		expect(await listItemLockEntries(repo, ARBITER, gitEnv())).toEqual([]);
+		// And the gc --ledger REPORT names no lock (so it prints no `release-lock`
+		// hint for a lock that does not exist on the arbiter).
+		const report = await reportItemLocks(repo, ARBITER, gitEnv());
+		expect(report.locks).toEqual([]);
+		expect(formatItemLockReport(report)).toEqual([]);
+		expect(itemLockReportNeedsAttention(report)).toBe(false);
+	});
+
+	it('readItemLock returns undefined for a stale local ref (the --prune fetch prunes it, then show fails)', async () => {
+		const {repo, arbiter} = seedRepoWithArbiter(scratch.root, ['ghost']);
+		await plantStaleLocalLockRef(repo, arbiter, 'task:ghost');
+		expect(lockRefOnArbiter(arbiter, 'task-ghost')).toBe(false);
+		// Before: the stale local ref would make readItemLock report the item held.
+		const held = await readItemLock({
+			item: 'task:ghost',
+			cwd: repo,
+			arbiter: ARBITER,
+			env: gitEnv(),
+		});
+		expect(held).toBeUndefined();
+		// The --prune fetch inside readItemLock REAPED the stale local ref.
+		const localRefAfter = run(
+			'git',
+			['rev-parse', '--verify', '--quiet', 'refs/dorfl/lock/task-ghost'],
+			repo,
+			{env: gitEnv()},
+		);
+		expect(localRefAfter.status).not.toBe(0);
+	});
+
+	it('a REAL held lock (still on the arbiter) IS still reported (the fix does not drop live locks)', async () => {
+		const {repo, arbiter} = seedRepoWithArbiter(scratch.root, ['live']);
+		await acquireItemLock({
+			item: 'task:live',
+			action: 'implement',
+			cwd: repo,
+			arbiter: ARBITER,
+			env: gitEnv(),
+		});
+		expect(lockRefOnArbiter(arbiter, 'task-live')).toBe(true);
+		// A genuinely held lock IS listed + reported.
+		expect(await listItemLocks(repo, ARBITER, gitEnv())).toEqual(['task-live']);
+		const entries = await listItemLockEntries(repo, ARBITER, gitEnv());
+		expect(entries.map((e) => e.entry)).toEqual(['task-live']);
+		const report = await reportItemLocks(repo, ARBITER, gitEnv());
+		expect(report.locks.map((l) => l.lock.entry)).toEqual(['task-live']);
 	});
 });

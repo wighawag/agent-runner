@@ -11,6 +11,7 @@ import {
 	type LoadedRepoConfig,
 } from './repo-config.js';
 import {encodeRepoKey} from './repo-key.js';
+import {LOCK_REF_PREFIX} from './item-lock.js';
 
 export {encodeRepoKey} from './repo-key.js';
 
@@ -132,6 +133,27 @@ export function ensureMirror(options: EnsureMirrorOptions): EnsureMirrorResult {
 		// materialisation has its base; the per-branch onboard reads still fail loudly
 		// downstream if a needed ref is genuinely absent.
 		run('git', ['fetch', 'origin', '+refs/heads/*:refs/heads/*'], path, {env});
+		// PRUNE the per-item LOCK namespace against the arbiter (observation
+		// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`): the all-heads
+		// fetch above covers only `refs/heads/*`, so `refs/dorfl/lock/*` was never
+		// pruned here and released locks accumulated on the mirror indefinitely — a
+		// `gc --ledger` (or any `status`/`scan` read) that reads the mirror then
+		// reported locks that no longer exist on the arbiter. Best-effort (soft):
+		// an unreachable arbiter leaves the existing lock refs in place (the
+		// read-side `listItemLocks`/`listItemLockEntries` read the arbiter DIRECTLY
+		// via `ls-remote`, so this is the proactive keep-the-mirror-clean pass, not
+		// the load-bearing one).
+		run(
+			'git',
+			[
+				'fetch',
+				'--prune',
+				'origin',
+				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
+			],
+			path,
+			{env},
+		);
 		fetched = true;
 	} else {
 		// First time: a bare mirror clone (shared object store, cheap).

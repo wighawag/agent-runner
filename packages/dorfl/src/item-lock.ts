@@ -298,10 +298,14 @@ export async function acquireItemLock(
 	const entry = lockEntryFor(opts.item);
 	const ref = itemLockRef(entry);
 	try {
-		// Fetch the current lock refs so the lease sees the real state.
+		// Fetch the current lock refs (PRUNED) so the lease sees the real arbiter
+		// state — `--prune` keeps the local `refs/dorfl/lock/*` namespace from
+		// accumulating refs the arbiter has deleted (observation
+		// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`).
 		await gitHard(
 			[
 				'fetch',
+				'--prune',
 				'--quiet',
 				arbiter,
 				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
@@ -393,9 +397,13 @@ async function releaseLockEntry(
 ): Promise<ReleaseResult> {
 	const ref = itemLockRef(entry);
 	try {
+		// `--prune` so a lock already released on the arbiter reads as not-held
+		// (its stale local ref is pruned) rather than as a phantom hold
+		// (observation `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`).
 		await gitHard(
 			[
 				'fetch',
+				'--prune',
 				'--quiet',
 				arbiter,
 				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
@@ -558,8 +566,18 @@ async function fetchHeldEntry(
 	arbiter: string,
 	env: NodeJS.ProcessEnv | undefined,
 ): Promise<{lock: LockEntry; sha: string} | undefined> {
+	// `--prune` so a lock RELEASED on the arbiter (its ref deleted there) is PRUNED
+	// locally — otherwise the stale local ref survives and `rev-parse`/`show` below
+	// read it as still held (observation
+	// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`).
 	await gitHard(
-		['fetch', '--quiet', arbiter, `+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`],
+		[
+			'fetch',
+			'--prune',
+			'--quiet',
+			arbiter,
+			`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
+		],
 		cwd,
 		env,
 	);
@@ -903,8 +921,19 @@ export async function readItemLock(
 	const env = opts.env;
 	const cwd = opts.cwd;
 	const ref = itemLockRef(lockEntryFor(opts.item));
+	// `--prune` so a lock RELEASED on the arbiter (its ref deleted there) is PRUNED
+	// locally — otherwise the stale local `refs/dorfl/lock/<entry>` would survive
+	// and `git show <ref>:lock.md` below would read it as still held (observation
+	// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`). After the prune,
+	// a released lock's ref is gone locally ⇒ `show` fails ⇒ `undefined` (not locked).
 	await gitHard(
-		['fetch', '--quiet', arbiter, `+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`],
+		[
+			'fetch',
+			'--prune',
+			'--quiet',
+			arbiter,
+			`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
+		],
 		cwd,
 		env,
 	);
@@ -1052,10 +1081,13 @@ export async function reconcileItemLockAgainstMain(
 	const ref = itemLockRef(entry);
 	try {
 		// One fetch refreshes BOTH the lock refs and `<arbiter>/main` so the lock and
-		// the durable record are read from the SAME live arbiter snapshot.
+		// the durable record are read from the SAME live arbiter snapshot. `--prune`
+		// keeps the local lock namespace from accumulating refs the arbiter deleted
+		// (observation `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`).
 		await gitHard(
 			[
 				'fetch',
+				'--prune',
 				'--quiet',
 				arbiter,
 				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
@@ -1235,9 +1267,12 @@ export async function classifyItemLockAgainstMain(
 	const entry = lockEntryFor(opts.item);
 	const ref = itemLockRef(entry);
 	try {
+		// `--prune` keeps the local lock namespace from accumulating refs the
+		// arbiter deleted (observation `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`).
 		await gitHard(
 			[
 				'fetch',
+				'--prune',
 				'--quiet',
 				arbiter,
 				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
@@ -1799,8 +1834,25 @@ export async function listItemLocks(
 	arbiter = 'origin',
 	env?: NodeJS.ProcessEnv,
 ): Promise<string[]> {
+	// `--prune` so a lock RELEASED on the arbiter (its ref deleted there) is PRUNED
+	// locally — a bare `git fetch +refs/dorfl/lock/*:refs/dorfl/lock/*` (force, NO
+	// `--prune`) leaves local refs the arbiter has since DELETED, so `for-each-ref`
+	// would list locks that no longer exist (observation
+	// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`). After the pruned
+	// fetch the local `refs/dorfl/lock/*` namespace EXACTLY matches the arbiter's, so
+	// `for-each-ref` reads the arbiter's actual lock set. The refs are materialized
+	// LOCALLY (not just `ls-remote`) because callers like `migrateStuckLocks` read a
+	// lock's body via `git show <ref>:lock.md` after this. A fault THROWS (fail-closed
+	// for the SELECTION path via {@link heldTaskSlugsStrict}; the graceful
+	// {@link heldTaskSlugs}/{@link heldSpecSlugs} twins catch it).
 	await gitHard(
-		['fetch', '--quiet', arbiter, `+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`],
+		[
+			'fetch',
+			'--prune',
+			'--quiet',
+			arbiter,
+			`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
+		],
 		cwd,
 		env,
 	);
@@ -1837,9 +1889,44 @@ export async function listItemLockEntries(
 	env?: NodeJS.ProcessEnv,
 ): Promise<LockEntry[]> {
 	try {
-		await gitHard(
+		// Read the arbiter DIRECTLY (`git ls-remote`) for the AUTHORITATIVE lock ref
+		// set — NOT the local `refs/dorfl/lock/*` refs (observation
+		// `gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state`): a bare
+		// `git fetch +refs/dorfl/lock/*:refs/dorfl/lock/*` (force, NO `--prune`)
+		// leaves local refs the arbiter has since DELETED, so `for-each-ref` would
+		// report locks that no longer exist — and `gc --ledger`'s entire purpose is
+		// to name locks a human should delete, so it MUST NOT name locks that do not
+		// exist. `ls-remote` lists ONLY the refs that ACTUALLY exist on the arbiter
+		// right now; the report is bounded by THAT set, never by accumulated local
+		// state. A fault degrades to an EMPTY report (US #12 — recoverable), exactly
+		// as an absent lock-ref namespace reads; an arbiter with no locks returns
+		// exit 0 + empty output ⇒ `[]`.
+		const ls = await gitSoft(
+			['ls-remote', arbiter, `${LOCK_REF_PREFIX}/*`],
+			cwd,
+			env,
+		);
+		if (ls.status !== 0) {
+			return [];
+		}
+		const refs = ls.stdout
+			.split('\n')
+			.map((l) => l.trim())
+			.filter((l) => l !== '')
+			.map((l) => l.split(/\s+/)[1])
+			.filter((ref) => ref.startsWith(`${LOCK_REF_PREFIX}/`))
+			.sort();
+		if (refs.length === 0) {
+			return [];
+		}
+		// Materialize the objects AND keep the local `refs/dorfl/lock/*` namespace
+		// PRUNED to match the arbiter (best-effort). The list above is already
+		// bounded by `ls-remote`, so a fetch fault here can only UNDER-report (skip
+		// content), never name a non-existent ref — the safe direction.
+		await gitSoft(
 			[
 				'fetch',
+				'--prune',
 				'--quiet',
 				arbiter,
 				`+${LOCK_REF_PREFIX}/*:${LOCK_REF_PREFIX}/*`,
@@ -1847,19 +1934,6 @@ export async function listItemLockEntries(
 			cwd,
 			env,
 		);
-		const out = await gitSoft(
-			['for-each-ref', '--format=%(refname)', `${LOCK_REF_PREFIX}/*`],
-			cwd,
-			env,
-		);
-		if (out.status !== 0) {
-			return [];
-		}
-		const refs = out.stdout
-			.split('\n')
-			.map((l) => l.trim())
-			.filter((l) => l.startsWith(`${LOCK_REF_PREFIX}/`))
-			.sort();
 		const entries: LockEntry[] = [];
 		for (const ref of refs) {
 			const show = await gitSoft(['show', `${ref}:lock.md`], cwd, env);

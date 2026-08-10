@@ -9,7 +9,8 @@ import {
 	mirrorMainSha,
 	readRepoConfigFromMirrorMain,
 } from '../src/repo-mirror.js';
-import {git} from '../src/git.js';
+import {git, run} from '../src/git.js';
+import {acquireItemLock, itemLockRef, lockEntryFor} from '../src/item-lock.js';
 import {
 	makeScratch,
 	seedRepoWithArbiter,
@@ -313,5 +314,81 @@ describe('mirrorMainSha', () => {
 		const arbiterMain = gitIn(['rev-parse', 'main'], repo).trim();
 		expect(mirrorMainSha(result.path, gitEnv())).toBe(arbiterMain);
 		expect(result.mainSha).toBe(arbiterMain);
+	});
+});
+
+// --- gc-ledger-reports-mirror-stale-lock-refs-as-arbiter-state (mirror prune) --
+//
+// Regression: `ensureMirror` fetched only `refs/heads/*` (and `main`), NEVER
+// `refs/dorfl/lock/*`, so a lock released on the arbiter (its ref deleted there)
+// survived on the mirror indefinitely. Any reader that read the mirror's local
+// lock refs (the `gc --ledger` report, `status`/`scan`) then reported locks that
+// did not exist on the arbiter. `ensureMirror` now PRUNES the per-item lock
+// namespace against the arbiter on every sync, so released locks cannot
+// accumulate on the mirror.
+
+describe('ensureMirror — prunes refs/dorfl/lock/* against the arbiter (no stale accumulation)', () => {
+	it('a lock released on the arbiter is PRUNED from the mirror on the next sync', async () => {
+		const {repo, arbiter} = seedRepoWithArbiter(scratch.root, ['feat']);
+		const url = `file://${arbiter}`;
+		const workspacesDir = join(scratch.root, '.dorfl');
+
+		// Create the mirror.
+		const first = ensureMirror({url, workspacesDir, env: gitEnv()});
+		expect(first.created).toBe(true);
+
+		// Acquire a lock on the arbiter (the real ref lands on the arbiter).
+		const acq = await acquireItemLock({
+			item: 'task:feat',
+			action: 'implement',
+			cwd: repo,
+			arbiter: 'arbiter',
+			env: gitEnv(),
+		});
+		expect(acq.outcome).toBe('acquired');
+		const entry = lockEntryFor('task:feat');
+		const ref = itemLockRef(entry);
+
+		// Pull the lock ref INTO the mirror's local refs/dorfl/lock/* (the
+		// accumulated state a pre-fix unpruned sync left behind on the mirror).
+		run('git', ['fetch', '-q', 'origin', `+${ref}:${ref}`], first.path, {
+			env: gitEnv(),
+		});
+		const mirrorHeld = run(
+			'git',
+			['rev-parse', '--verify', '--quiet', ref],
+			first.path,
+			{env: gitEnv()},
+		);
+		expect(mirrorHeld.status).toBe(0); // the mirror now holds the lock ref
+
+		// Release the lock on the ARBITER ONLY (delete the ref on the arbiter; the
+		// mirror's local copy is left stale — the defect's accumulated state).
+		run('git', ['push', '-q', 'arbiter', `:${ref}`], repo, {env: gitEnv()});
+		// The arbiter no longer holds it ...
+		const arbiterHeld = run('git', ['ls-remote', 'origin', ref], first.path, {
+			env: gitEnv(),
+		});
+		expect(arbiterHeld.stdout.trim()).toBe('');
+		// ... but the mirror's STALE local ref is still there before the sync.
+		const staleBefore = run(
+			'git',
+			['rev-parse', '--verify', '--quiet', ref],
+			first.path,
+			{env: gitEnv()},
+		);
+		expect(staleBefore.status).toBe(0);
+
+		// Re-sync the mirror. ensureMirror now PRUNES refs/dorfl/lock/* against the
+		// arbiter, so the released lock's ref is REMOVED from the mirror.
+		const second = ensureMirror({url, workspacesDir, env: gitEnv()});
+		expect(second.fetched).toBe(true);
+		const staleAfter = run(
+			'git',
+			['rev-parse', '--verify', '--quiet', ref],
+			first.path,
+			{env: gitEnv()},
+		);
+		expect(staleAfter.status).not.toBe(0); // pruned — the mirror no longer holds it
 	});
 });
