@@ -44,7 +44,9 @@ import {
 	runTaskReviewLoop,
 	type TaskReviewGate,
 	type RunTaskReviewLoopResult,
+	REVIEW_EDITS_SCRATCH_DIR,
 } from './tasker-review-loop.js';
+import {ReviewParseError, ReviewOutputCappedError} from './review-verdict.js';
 import type {ReviewGate} from './review-gate.js';
 
 /**
@@ -551,22 +553,78 @@ export async function performTask(
 	//     AGENT path runs the loop — the human tasking path is unaffected.
 	let loopDisposition: RunTaskReviewLoopResult | undefined;
 	if (options.reviewLoop && doer === 'agent') {
-		loopDisposition = await runTaskReviewLoop({
-			slug,
-			cwd,
-			gate: options.reviewLoop,
-			// SCOPING FENCE (the requeue fix): the loop reviews/edits/flags ONLY the
-			// tasks THIS run produced (new-or-changed vs `before`), never the
-			// pre-existing staged tasks that share `work/tasks/backlog/`.
-			before,
-			taskerLoopMax: options.taskerLoopMax ?? 3,
-			executions: options.reviewExecutions,
-			taskerLoopModel: options.taskerLoopModel,
-			sessionsDir: options.sessionsDir,
-			// The improver loop's review AGENT launches AMBIENT, never the identity.
-			env: agentEnv,
-			note,
-		});
+		// REVIEW-LEG FAILURE handling (observation
+		// `tasker-review-edits-payload-caps-the-verdict-response`): the tasker produced
+		// a good candidate set but the review/improver leg can fail to return a
+		// parseable verdict (a generic parse failure, or the NAMED cap-truncation
+		// class). The pre-fix behaviour THREW here, crashing the run, LEAVING THE
+		// LOCK HELD, writing NO question sidecar, and DISCARDING the tasker's
+		// candidate tasks. Now: catch it, PERSIST the candidate tasks, and BOUNCE
+		// through the SAME surface the decomposition-unclear path uses (release the
+		// lock + a question sidecar). NEVER a silent approve — a parse failure is
+		// always a needs-attention route. A non-review throw (genuine wiring error)
+		// is re-thrown.
+		try {
+			loopDisposition = await runTaskReviewLoop({
+				slug,
+				cwd,
+				gate: options.reviewLoop,
+				// SCOPING FENCE (the requeue fix): the loop reviews/edits/flags ONLY the
+				// tasks THIS run produced (new-or-changed vs `before`), never the
+				// pre-existing staged tasks that share `work/tasks/backlog/`.
+				before,
+				taskerLoopMax: options.taskerLoopMax ?? 3,
+				executions: options.reviewExecutions,
+				taskerLoopModel: options.taskerLoopModel,
+				sessionsDir: options.sessionsDir,
+				// The improver loop's review AGENT launches AMBIENT, never the identity.
+				env: agentEnv,
+				note,
+			});
+		} catch (err) {
+			if (!(err instanceof ReviewParseError)) {
+				throw err;
+			}
+			const reviewErr = err as ReviewParseError;
+			// Reap any review-edits SCRATCH the failed pass left on disk so it is never
+			// swept into a later run's integrate commit.
+			try {
+				rmSync(join(cwd, REVIEW_EDITS_SCRATCH_DIR), {
+					recursive: true,
+					force: true,
+				});
+			} catch {
+				// Best-effort.
+			}
+			const candidatePaths = await persistTaskingCandidates(
+				cwd,
+				slug,
+				before,
+				arbiter,
+				env,
+				note,
+			);
+			const reason = reviewFailureReason(slug, reviewErr, candidatePaths);
+			const message = reviewFailureMessage(slug, reviewErr);
+			if (useLock) {
+				return await surfaceTaskingBlock({
+					slug,
+					cwd,
+					arbiter,
+					reason,
+					message,
+					lockedBlob,
+					release: lock.release,
+					mode: resolvedMode,
+					provider: options.providerInstance,
+					env,
+					note,
+				});
+			}
+			note(reason);
+			// Human, no-lock path: a clean park-for-human is a success terminal (exit 0).
+			return {exitCode: 0, outcome: 'needs-attention', slug, message};
+		}
 		// DECOMPOSITION UNCLEAR: emit NO guessed tasks — route the held spec to
 		// needs-attention with the questions as the reason. The lock release amends the
 		// `spec:<slug>` unified lock `active → stuck` (the tasking needs-attention surface
@@ -1330,6 +1388,130 @@ function decompositionUnclearReason(slug: string, questions: string[]): string {
 			? questions.map((q) => `- ${q}`).join('\n')
 			: '- (no specific questions surfaced; the decomposition is broadly unclear)';
 	return `${head}\n${body}`;
+}
+
+/**
+ * The needs-attention REASON for a REVIEW-LEG FAILURE (a parse failure, or the
+ * NAMED cap-truncation class — observation
+ * `tasker-review-edits-payload-caps-the-verdict-response`). The tasker produced a
+ * good candidate set but the review/improver leg could not return a parseable
+ * verdict, so the run is parked (the lock RELEASED, a question sidecar written)
+ * rather than the whole tasking discarded. Names the failure precisely so an
+ * operator does not mis-read a cap-truncation as a model flake and retry blindly.
+ * The candidate tasks the tasker produced are PERSISTED on the work branch (see
+ * {@link persistTaskingCandidates}) so a human can recover them.
+ */
+function reviewFailureReason(
+	slug: string,
+	err: ReviewParseError,
+	candidatePaths: string[],
+): string {
+	const named =
+		err instanceof ReviewOutputCappedError
+			? `The tasker review leg failed on '${slug}': ${err.message}. This is a ` +
+				"STRUCTURAL cap-truncation (the review edits payload shared the model's " +
+				'capped output response with the verdict), NOT a model flake — do not ' +
+				'blindly retry; the run is parked for you to recover the candidate tasks ' +
+				'and re-task.'
+			: `The tasker review leg failed on '${slug}': the review agent produced no ` +
+				`parseable verdict (${err.message}). The run is parked for you to recover ` +
+				'the candidate tasks and re-task.';
+	const tasks =
+		candidatePaths.length > 0
+			? `\n\nThe tasker produced ${candidatePaths.length} candidate task(s) before the ` +
+				'review leg failed; they are saved on the work branch ' +
+				`'${workBranchRef('spec', slug)}' (commit "chore(tasking): save candidate ` +
+				`tasks") for recovery:\n${candidatePaths.map((p) => `- ${p}`).join('\n')}`
+			: '\n\n(No candidate tasks were on disk when the review leg failed.)';
+	return `${named}${tasks}`;
+}
+
+/** The human-readable terminal MESSAGE for a review-leg failure (the result's `message`). */
+function reviewFailureMessage(slug: string, err: ReviewParseError): string {
+	if (err instanceof ReviewOutputCappedError) {
+		return (
+			`Tasking '${slug}' parked: the review leg hit the model output cap ` +
+			`(${err.outputTokens} tokens) and was truncated before emitting its ` +
+			'verdict. The candidate tasks were saved on the work branch; the lock was ' +
+			'released and a question surfaced.'
+		);
+	}
+	return (
+		`Tasking '${slug}' parked: the review leg produced no parseable verdict ` +
+		`(${err.message}). The candidate tasks were saved on the work branch; the ` +
+		'lock was released and a question surfaced.'
+	);
+}
+
+/**
+ * PERSIST the tasker's candidate tasks (priority: do not discard the tasker's work
+ * on the review-failure path). Commits the new-or-changed `work/tasks/backlog/*.md`
+ * (this run's own output vs `before`) to the work branch under a marker commit,
+ * then pushes the branch to the arbiter BEST-EFFORT (a push failure is noted, not
+ * fatal — the local branch commit still survives a worktree teardown and is
+ * recoverable by `git checkout work/spec-<slug>`). Returns the repo-relative
+ * candidate paths persisted (empty when there were none). Never throws — a git
+ * failure is noted and the bounce proceeds (the lock is still released).
+ */
+async function persistTaskingCandidates(
+	cwd: string,
+	slug: string,
+	before: Map<string, string>,
+	arbiter: string,
+	env: NodeJS.ProcessEnv | undefined,
+	note: (message: string) => void,
+): Promise<string[]> {
+	const candidatePaths = newOrChangedStagedTasks(cwd, before);
+	if (candidatePaths.length === 0) {
+		return [];
+	}
+	const branch = workBranchRef('spec', slug);
+	try {
+		await gitHard(['add', '--', ...candidatePaths], cwd, env);
+		// Commit only if something is actually staged (a clean tree → nothing to save).
+		const diffCached = await gitSoft(['diff', '--cached', '--quiet'], cwd, env);
+		if (diffCached.status === 0) {
+			return candidatePaths; // nothing new staged (already committed by a prior step).
+		}
+		await gitHard(
+			[
+				'commit',
+				'-q',
+				'-m',
+				`chore(tasking): save candidate tasks for '${slug}' (review leg failed; not landed)`,
+			],
+			cwd,
+			env,
+		);
+	} catch (err) {
+		note(
+			`Could not commit the candidate tasks to the work branch for recovery ` +
+				`(best-effort; the bounce still proceeds): ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+		);
+		return candidatePaths;
+	}
+	// Push the work branch best-effort so the candidate tasks survive a worktree
+	// teardown on an isolated run (the branch ref survives locally too, but a push
+	// makes them remote-recoverable). A push failure is noted, never fatal.
+	try {
+		const pushed = await gitSoft(['push', arbiter, branch], cwd, env);
+		if (pushed.status !== 0) {
+			note(
+				`Could not push the candidate-tasks work branch '${branch}' to ${arbiter} ` +
+					`(best-effort; the local commit still persists for recovery).`,
+			);
+		}
+	} catch (err) {
+		note(
+			`Could not push the candidate-tasks work branch '${branch}' to ${arbiter} ` +
+				`(best-effort; the local commit still persists for recovery): ${
+					err instanceof Error ? err.message : String(err)
+				}`,
+		);
+	}
+	return candidatePaths;
 }
 
 /**

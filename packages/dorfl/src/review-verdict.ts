@@ -40,8 +40,27 @@ export interface ReviewFinding {
 export interface TaskEdit {
 	/** Repo-relative path of the candidate task file to write. */
 	path: string;
-	/** The full replacement content for that file. */
-	content: string;
+	/**
+	 * The full replacement content for that file, emitted INLINE. LEGACY / small-edit
+	 * form. UNBOUNDED: a large decomposition's worth of full-file bodies in ONE JSON
+	 * object shares the model's capped response with the verdict, so a rich spec can
+	 * cap-truncate the response before the verdict closes (observation
+	 * `tasker-review-edits-payload-caps-the-verdict-response`). The tasker improver loop
+	 * now asks the agent to WRITE each edited body to a scratch file and reference it by
+	 * `src` instead (see {@link src}) so the verdict is obtainable independent of edit
+	 * size. Kept (optional) so a small inline edit + the existing tests still work.
+	 */
+	content?: string;
+	/**
+	 * Repo-relative path to a SCRATCH file the agent WROTE the full replacement body
+	 * to (the runner reads it, applies it through the SAME scope fence, then deletes
+	 * it). The DECOUPLED form: the verdict JSON carries only PATHS, so its size is
+	 * bounded by the NUMBER of edits, not the total body size — a large decomposition
+	 * can no longer cap-truncate the verdict. The agent writes the scratch file itself
+	 * (it runs in the job worktree and has the `write` tool); the runner applies /
+	 * commits. Exactly one of {@link content} / {@link src} carries the body.
+	 */
+	src?: string;
 }
 
 /**
@@ -90,6 +109,39 @@ export interface ReviewVerdict {
 
 /** Raised when the review agent ran but produced no parseable verdict. */
 export class ReviewParseError extends Error {}
+
+/**
+ * Raised when the review agent's output was TRUNCATED at the model's output cap
+ * before it could emit a complete verdict — a DISTINCT, named failure class so it is
+ * never mis-reported as a generic "produced no parseable result" (which reads as a
+ * flake and invites a blind retry, burning a second full tasking run).
+ *
+ * It is a SUBCLASS of {@link ReviewParseError} so every existing
+ * `catch (ReviewParseError)` site (the tasker-review loop's bounce routing) still
+ * catches it UNIFORMLY and routes to needs-attention — NEVER a silent approve. The
+ * only thing that changes is the MESSAGE: it names the cap and the token count so
+ * an operator knows the structural cause (the edits payload is unbounded and
+ * shared the capped response with the verdict) rather than chasing a model flake.
+ *
+ * Detected at the harness seam: the adapter surfaces the last assistant turn's
+ * `stop_reason` (null / `None` / `max_tokens` — the turn did not end naturally) and
+ * its `usage.output` token count; the gate throws this when a parse fails AND that
+ * cap signal is present. When the adapter CANNOT see the signal (the null/shell
+ * adapter, or a future adapter without usage telemetry), the parse still fails as a
+ * generic {@link ReviewParseError} — still needs-attention, never a silent approve.
+ */
+export class ReviewOutputCappedError extends ReviewParseError {
+	/** The output token count the agent reached when the cap hit (the observed `usage.output`). */
+	readonly outputTokens: number;
+	constructor(outputTokens: number) {
+		super(
+			`review agent output hit the model output cap (${outputTokens} tokens) ` +
+				'and was truncated before emitting its verdict',
+		);
+		this.name = 'ReviewOutputCappedError';
+		this.outputTokens = outputTokens;
+	}
+}
 
 /**
  * Parse the unified review verdict out of the review agent's textual output.
@@ -246,9 +298,22 @@ function parseEdits(raw: unknown): TaskEdit[] {
 			continue;
 		}
 		const item = e as Record<string, unknown>;
-		if (typeof item.path === 'string' && typeof item.content === 'string') {
-			out.push({path: item.path, content: item.content});
+		if (typeof item.path !== 'string') {
+			continue;
 		}
+		// The body is either inline `content` (legacy / small edits) OR a `src` scratch
+		// path the agent wrote (the decoupled form — see TaskEdit). Carry whichever
+		// is present; the runner resolves it. An edit with NEITHER is dropped (no body
+		// to apply) — but a path-only edit is also tolerated as a no-op marker so a
+		// verdict that names a path it did not actually rewrite does not crash the loop.
+		const edit: TaskEdit = {path: item.path};
+		if (typeof item.content === 'string') {
+			edit.content = item.content;
+		}
+		if (typeof item.src === 'string') {
+			edit.src = item.src;
+		}
+		out.push(edit);
 	}
 	return out;
 }
@@ -314,7 +379,10 @@ export function verdictContractPrompt(): string {
 		'   {"severity": "blocking" | "non-blocking", "question": "\u2026", "context": "\u2026"}',
 		' ],',
 		' "review": "<the human-readable PR-comment prose, when the caller asks for it>",',
-		' "edits": [ {"path": "work/tasks/backlog/<slug>.md", "content": "<full replacement>"} ],',
+		' "edits": [ {"path": "work/tasks/backlog/<slug>.md", "src": "<scratch path you wrote the full body to>"} ],',
+		'       // (inline "content": "<full replacement>" is the legacy small-edit form —',
+		'       //  the tasker loop writes the body to a scratch file + references it by',
+		'       //  "src" so the edits payload cannot cap-truncate this verdict)',
 		' "edit": "<single in-memory replacement body, for the lone-task review>",',
 		' "questions": ["<open question for the human>"],',
 		' "uncertainTasks": [ {"path": "work/tasks/backlog/<slug>.md", "questions": ["\u2026"]} ],',

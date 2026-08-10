@@ -1,0 +1,21 @@
+---
+'dorfl': patch
+---
+
+Fix the tasker-review leg crashing `dorfl do spec:<slug>` on any large spec.
+
+Running `dorfl do spec:<slug> --isolated --propose` on a substantial spec printed `review agent produced no parseable {verdict, findings} result` and died — no task branch, no PR, nothing emitted — leaving the tasking lock held (cleared only by hand via `dorfl release-lock`) and writing no `work/questions/spec-<slug>.md` sidecar. It was deterministic, not a flaky model: the tasker itself produced a good decomposition, but the review leg failed and the whole run was discarded with it.
+
+The root cause was structural and upstream of the parser. `verdictContractPrompt` asked the review agent to emit the FULL replacement body of every edited task file inline as `edits: [{path, content: "<full replacement>"}]` in the SAME single JSON object as the verdict — an unbounded payload sharing one capped model response with the verdict. The richer the spec, the more edit body bytes, the more certain the response cap-truncated mid-object before the verdict closed. `extractJsonObjectSpan` then returned `undefined`, `parseReviewVerdict` threw, and the throw propagated out of `performTask` (there was no try/catch around the review loop). The parser was correct to refuse to invent a verdict and is left unchanged.
+
+Four fixes, in priority order:
+
+1. The unbounded full-file `edits` payload is moved off the capped response. The review agent now WRITES each edited task body to a scratch file under `work/tasks/.review-edits/` and references it by `src` in the verdict JSON (a new optional `TaskEdit.src` channel; inline `content` is kept as the legacy small-edit form). The verdict JSON now carries only paths, so its size is bounded by the NUMBER of edits, not the total body size — a large decomposition can no longer cap-truncate the verdict. The runner reads the scratch body, applies it through the SAME scope fence (unchanged), and reaps the scratch so the integrate's `git add -A` never sweeps it. Because the agent writes to scratch (not the target), the tasker's pristine candidate tasks stay untouched until the verdict parses.
+
+2. Cap-truncation is now detected and NAMED at the harness seam. `LaunchResult` carries a new `outputCapped` signal (the observed `usage.output` token count), populated by the pi adapter from the session log's last assistant turn's `stop_reason` (`null`/`None`/`max_tokens`) + `usage.output`. When a parse fails AND that signal is present, the gate throws the new `ReviewOutputCappedError` ("review agent output hit the model output cap (16384 tokens) and was truncated before emitting its verdict") instead of the generic parse error — so an operator no longer mis-reads it as a flake and retries blindly, burning a second full tasking run. A verdict that DID close on a capped turn is still honored. When the adapter cannot see the signal (the null/shell adapter), the parse still fails as a generic `ReviewParseError` — still needs-attention, never a silent approve.
+
+3. The tasker's work is no longer discarded on this path. `performTask` catches the review failure and `persistTaskingCandidates` commits the candidate tasks to the work branch (`work/spec-<slug>`) with a marker commit and pushes best-effort, so a retry or a human can recover them.
+
+4. The lock is released and the documented bounce completed. The catch routes through the existing `surfaceTaskingBlock` (release the tasking lock + write the `work/questions/spec-<slug>.md` sidecar), identical to the decomposition-unclear path — the lock is released and the sidecar written, honouring the WORK-CONTRACT end-of-leg release on success OR bounce.
+
+`ReviewOutputCappedError` subclasses `ReviewParseError` so every existing `catch (ReviewParseError)` site routes it to needs-attention uniformly — a parse failure is never turned into a silent approve, and the narrow control-character repair pass in `parseReviewVerdict` is left exactly as narrow as it was. Adds regression tests driving the tasker-review gate with a response truncated at the output cap (asserting the named failure + lock release + candidate-task persistence) and a non-review throw is re-thrown.

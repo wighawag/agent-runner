@@ -14,9 +14,16 @@ import {
 	runTaskReviewLoop,
 	parseTaskReviewVerdict,
 	buildTaskReviewPrompt,
+	harnessTaskReviewGate,
+	REVIEW_EDITS_SCRATCH_DIR,
 	type TaskReviewGate,
 	type TaskReviewVerdict,
 } from '../src/tasker-review-loop.js';
+import {
+	ReviewOutputCappedError,
+	ReviewParseError,
+} from '../src/review-verdict.js';
+import type {Harness, LaunchResult, LaunchInput} from '../src/harness.js';
 
 /**
  * Pure-logic tests for the tasker review→edit→converge LOOP
@@ -520,5 +527,266 @@ describe('buildTaskReviewPrompt — frames the artifact + the output shape', () 
 		expect(prompt).toMatch(/gaps/i);
 		expect(prompt).toMatch(/overlap/i);
 		expect(prompt).toMatch(/goal-composition/i);
+	});
+});
+
+// --- The DECOUPLED edits channel (write-to-scratch + reference by path) -------
+
+describe('applyEdits via `src` (the DECOUPLED edits channel)', () => {
+	it('reads the edit body from the agent-written scratch file, applies it, then DELETES the scratch', async () => {
+		const mine = seedCandidate('child', 'draft');
+		const scratchRel = `${REVIEW_EDITS_SCRATCH_DIR}/child.md`;
+		// The agent writes the FULL replacement body to the scratch dir DURING the
+		// review pass (the start-of-loop clean has already reaped any stragglers),
+		// then emits a `src` reference (the verdict JSON stays tiny — no inline
+		// content). Simulate that by writing the scratch inside the gate.
+		const gate: TaskReviewGate = async (input) => {
+			if (input.pass === 1) {
+				mkdirSync(join(cwd, REVIEW_EDITS_SCRATCH_DIR), {recursive: true});
+				writeFileSync(
+					join(cwd, scratchRel),
+					'---\nslug: child\nprd: it\n---\n\n## Prompt\n\n> IMPROVED via scratch\n',
+				);
+				return {
+					verdict: 'block',
+					findings: [{severity: 'blocking', question: 'thin'}],
+					edits: [{path: mine, src: scratchRel}],
+				};
+			}
+			return {verdict: 'approve', findings: []};
+		};
+		await runTaskReviewLoop({
+			slug: 'it',
+			cwd,
+			gate,
+			taskerLoopMax: 3,
+		});
+		// The scratch body was APPLIED to the candidate task.
+		expect(readFileSync(join(cwd, mine), 'utf8')).toMatch(
+			/IMPROVED via scratch/,
+		);
+		// The scratch file was REAPED (never swept into a later integrate commit).
+		let scratchGone = true;
+		try {
+			readFileSync(join(cwd, scratchRel), 'utf8');
+			scratchGone = false;
+		} catch {
+			/* expected: reaped */
+		}
+		expect(scratchGone).toBe(true);
+	});
+
+	it('REFUSES a `src` outside the review-edits scratch dir (no arbitrary-file read)', async () => {
+		const mine = seedCandidate('child', 'draft');
+		const secret = join(cwd, 'work', 'specs', 'ready', 'it.md');
+		mkdirSync(join(cwd, 'work', 'specs', 'ready'), {recursive: true});
+		writeFileSync(secret, 'SECRET PRD');
+		await runTaskReviewLoop({
+			slug: 'it',
+			cwd,
+			gate: scriptedGate([
+				{
+					verdict: 'block',
+					findings: [{severity: 'blocking', question: 'x'}],
+					edits: [{path: mine, src: 'work/specs/ready/it.md'}],
+				},
+				{verdict: 'approve', findings: []},
+			]),
+			taskerLoopMax: 3,
+		});
+		// The escaping src was NOT applied — the candidate keeps its draft body.
+		expect(readFileSync(join(cwd, mine), 'utf8')).toMatch(/> draft/);
+		expect(readFileSync(secret, 'utf8')).toBe('SECRET PRD');
+	});
+
+	it('a `src` scratch file the agent did NOT write is skipped (no crash, no clobber)', async () => {
+		const mine = seedCandidate('child', 'draft');
+		await runTaskReviewLoop({
+			slug: 'it',
+			cwd,
+			gate: scriptedGate([
+				{
+					verdict: 'block',
+					findings: [{severity: 'blocking', question: 'x'}],
+					edits: [{path: mine, src: `${REVIEW_EDITS_SCRATCH_DIR}/missing.md`}],
+				},
+				{verdict: 'approve', findings: []},
+			]),
+			taskerLoopMax: 3,
+		});
+		expect(readFileSync(join(cwd, mine), 'utf8')).toMatch(/> draft/);
+	});
+
+	it('inline `content` still works (the legacy small-edit form is kept)', async () => {
+		const mine = seedCandidate('child', 'draft');
+		await runTaskReviewLoop({
+			slug: 'it',
+			cwd,
+			gate: scriptedGate([
+				{
+					verdict: 'block',
+					findings: [{severity: 'blocking', question: 'thin'}],
+					edits: [
+						{
+							path: mine,
+							content:
+								'---\nslug: child\nprd: it\n---\n\n## Prompt\n\n> INLINE improved\n',
+						},
+					],
+				},
+				{verdict: 'approve', findings: []},
+			]),
+			taskerLoopMax: 3,
+		});
+		expect(readFileSync(join(cwd, mine), 'utf8')).toMatch(/INLINE improved/);
+	});
+});
+
+describe('buildTaskReviewPrompt — the decoupled edits channel (no inline content)', () => {
+	it('tells the agent to WRITE edit bodies to the scratch dir + reference by `src`', () => {
+		const prompt = buildTaskReviewPrompt({
+			slug: 'it',
+			cwd: '/tmp/x',
+			candidateTasks: ['work/tasks/backlog/child.md'],
+			pass: 1,
+			execution: 1,
+		});
+		expect(prompt).toContain(REVIEW_EDITS_SCRATCH_DIR);
+		expect(prompt).toMatch(/"src"/);
+		expect(prompt).toMatch(/do NOT inline the body in the JSON/i);
+		expect(prompt).toMatch(/cap-truncate/i);
+	});
+});
+
+// --- CAP-TRUNCATION detection at the harness seam (the named failure) --------
+
+/** A stub Harness whose `launch` returns a canned LaunchResult (no real model). */
+function stubHarness(result: Partial<LaunchResult>): Harness {
+	return {
+		adapter: 'stub',
+		launch: (_input: LaunchInput): LaunchResult => ({
+			ok: true,
+			record: {adapter: 'stub'},
+			...result,
+		}),
+		launchInteractive: () => {
+			throw new Error('not supported');
+		},
+		isAlive: () => false,
+	};
+}
+
+describe('harnessTaskReviewGate — names cap-truncation; never a silent approve', () => {
+	it('a parse failure WITH an output-cap signal throws the NAMED ReviewOutputCappedError', async () => {
+		const gate = harnessTaskReviewGate({
+			harness: stubHarness({
+				output: '{"verdict": "block", "findings": [', // truncated mid-object
+				outputCapped: 16384,
+			}),
+			agentCmd: 'echo',
+		});
+		const cwd2 = mkdtempSync(join(tmpdir(), 'tasker-review-cap-'));
+		try {
+			await expect(
+				gate({
+					slug: 'it',
+					cwd: cwd2,
+					candidateTasks: ['work/tasks/backlog/child.md'],
+					pass: 1,
+					execution: 1,
+				}),
+			).rejects.toThrow(ReviewOutputCappedError);
+			// And the message NAMES the cap + the token count, not a generic parse error.
+			await expect(
+				gate({
+					slug: 'it',
+					cwd: cwd2,
+					candidateTasks: ['work/tasks/backlog/child.md'],
+					pass: 1,
+					execution: 2,
+				}),
+			).rejects.toThrow(/hit the model output cap \(16384 tokens\)/);
+		} finally {
+			rmrf(cwd2);
+		}
+	});
+
+	it('a verdict that DID complete on a capped turn is HONORED (priority 1: verdict obtainable)', async () => {
+		// Even though the adapter signals a cap, if the JSON verdict actually closed
+		// the gate returns it (the verdict is obtainable independent of edit size).
+		const complete = JSON.stringify({verdict: 'approve', findings: []});
+		const gate = harnessTaskReviewGate({
+			harness: stubHarness({output: complete, outputCapped: 16384}),
+			agentCmd: 'echo',
+		});
+		const cwd2 = mkdtempSync(join(tmpdir(), 'tasker-review-cap-'));
+		try {
+			const verdict = await gate({
+				slug: 'it',
+				cwd: cwd2,
+				candidateTasks: ['work/tasks/backlog/child.md'],
+				pass: 1,
+				execution: 1,
+			});
+			expect(verdict.verdict).toBe('approve');
+		} finally {
+			rmrf(cwd2);
+		}
+	});
+
+	it('a parse failure with NO cap signal stays the generic ReviewParseError (not mis-named)', async () => {
+		const gate = harnessTaskReviewGate({
+			harness: stubHarness({output: 'totally unparseable prose'}),
+			agentCmd: 'echo',
+		});
+		const cwd2 = mkdtempSync(join(tmpdir(), 'tasker-review-cap-'));
+		try {
+			const err = await gate({
+				slug: 'it',
+				cwd: cwd2,
+				candidateTasks: ['work/tasks/backlog/child.md'],
+				pass: 1,
+				execution: 1,
+			}).then(
+				() => undefined,
+				(e: unknown) => e,
+			);
+			expect(err).toBeInstanceOf(ReviewParseError);
+			expect(err).not.toBeInstanceOf(ReviewOutputCappedError);
+			expect((err as Error).message).toMatch(/no parseable/);
+		} finally {
+			rmrf(cwd2);
+		}
+	});
+
+	it('a failed launch (ok=false) throws a ReviewParseError naming the launch failure', async () => {
+		const gate = harnessTaskReviewGate({
+			harness: stubHarness({ok: false, detail: 'pi crashed'}),
+			agentCmd: 'echo',
+		});
+		const cwd2 = mkdtempSync(join(tmpdir(), 'tasker-review-cap-'));
+		try {
+			await expect(
+				gate({
+					slug: 'it',
+					cwd: cwd2,
+					candidateTasks: ['work/tasks/backlog/child.md'],
+					pass: 1,
+					execution: 1,
+				}),
+			).rejects.toThrow(/task review agent launch failed.*pi crashed/);
+		} finally {
+			rmrf(cwd2);
+		}
+	});
+});
+
+describe('ReviewOutputCappedError — is a ReviewParseError subclass (uniform bounce routing)', () => {
+	it('is a ReviewParseError so every existing catch routes it to needs-attention', () => {
+		const err = new ReviewOutputCappedError(16384);
+		expect(err).toBeInstanceOf(ReviewParseError);
+		expect(err.outputTokens).toBe(16384);
+		expect(err.message).toMatch(/16384 tokens/);
+		expect(err.name).toBe('ReviewOutputCappedError');
 	});
 });

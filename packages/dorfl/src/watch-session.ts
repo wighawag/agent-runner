@@ -149,6 +149,10 @@ interface SessionLogRecord {
 	message?: {
 		role?: unknown;
 		content?: unknown;
+		/** The Anthropic-API turn-termination reason (mirrored by pi into the session log). */
+		stop_reason?: unknown;
+		/** The turn's token usage (mirrored by pi). `output` OR `output_tokens` is the produced-token count. */
+		usage?: unknown;
 	};
 }
 
@@ -286,10 +290,10 @@ function assistantContentText(content: unknown): string {
 /**
  * Extract the **last assistant message's text** from a pi session `.jsonl`
  * (task `harness-agent-output`) — the agent's final ANSWER, surfaced through
- * the harness seam as `LaunchResult.output`. It REUSES this module's session-log
- * shape walk (one parser, not two): it scans the `{type:"message",
- * message:{role:"assistant", content[]}}` records, takes the LAST one carrying
- * non-empty `text`, and returns its concatenated text.
+ * the harness seam as `LaunchResult.output`. A thin delegate to
+ * {@link lastAssistantTurn} (one walk, returning the `.text`); the turn reader
+ * ALSO carries the `stop_reason`/`usage` the pi adapter uses for the
+ * `LaunchResult.outputCapped` cap-truncation signal.
  *
  * Kept as a PURE `string → string | undefined` function on purpose: the pi
  * adapter reads the session file and passes the JSONL text in, but a future
@@ -307,7 +311,33 @@ function assistantContentText(content: unknown): string {
  * line in a just-closed log must not crash the reader.
  */
 export function lastAssistantText(jsonl: string): string | undefined {
-	let last: string | undefined;
+	return lastAssistantTurn(jsonl).text;
+}
+
+/**
+ * The last assistant turn's TEXT + its Anthropic-API turn-termination signal
+ * (`stop_reason` + `usage.output`/`usage.output_tokens` token count). Reused by
+ * the pi adapter to populate BOTH `LaunchResult.output` (the `.text`) AND
+ * `LaunchResult.outputCapped` (the cap-truncation signal — see
+ * {@link isOutputCappedTurn}). One walk over the `.jsonl`, not two. `text` is the
+ * LAST assistant turn carrying non-empty text (a tool-only turn does not
+ * supersede it); `stopReason`/`outputTokens` come from THAT same last-text turn when
+ * the record carries them, else `undefined`. Returns an all-`undefined` object
+ * for an empty / assistant-text-less log.
+ */
+export interface LastAssistantTurn {
+	/** The last assistant turn's concatenated `text` parts (its answer). */
+	text?: string;
+	/** The turn's `stop_reason` (raw — `null`, `'end_turn'`, `'max_tokens'`, …). */
+	stopReason?: string | null;
+	/** The turn's produced output-token count (`usage.output` OR `usage.output_tokens`). */
+	outputTokens?: number;
+}
+
+export function lastAssistantTurn(jsonl: string): LastAssistantTurn {
+	let lastText: string | undefined;
+	let lastStopReason: string | null | undefined = undefined;
+	let lastOutputTokens: number | undefined = undefined;
 	for (const line of jsonl.split('\n')) {
 		const trimmed = line.trim();
 		if (trimmed === '') {
@@ -332,10 +362,56 @@ export function lastAssistantText(jsonl: string): string | undefined {
 		}
 		const text = assistantContentText(message.content);
 		if (text !== '') {
-			last = text; // a later text turn supersedes an earlier one.
+			lastText = text; // a later text turn supersedes an earlier one.
+			lastStopReason = readStopReason(message.stop_reason);
+			lastOutputTokens = readOutputTokens(message.usage);
 		}
 	}
-	return last;
+	return {
+		text: lastText,
+		stopReason: lastStopReason,
+		outputTokens: lastOutputTokens,
+	};
+}
+
+/**
+ * Is this assistant turn's signal an OUTPUT-CAP truncation — the turn did NOT
+ * end naturally? `stop_reason` `null`/`None`/`undefined` (the turn was cut off) OR
+ * `'max_tokens'` (the model hit its output-token cap), together with a positive
+ * produced-token count. The `null`/`None` form is what pi's session log records
+ * when the `--print` run is truncated before the turn closes (observation
+ * `tasker-review-edits-payload-caps-the-verdict-response`); `'max_tokens'` is the
+ * standard API cap signal. Both name the same structural cause: the verdict never
+ * finished.
+ */
+export function isOutputCappedTurn(turn: LastAssistantTurn): boolean {
+	const cappedReason =
+		turn.stopReason === null ||
+		turn.stopReason === undefined ||
+		turn.stopReason === 'None' ||
+		turn.stopReason === 'max_tokens';
+	return cappedReason && (turn.outputTokens ?? 0) > 0;
+}
+
+/** Read `stop_reason` defensively as a string-or-null (pi may emit `None`/`null`). */
+function readStopReason(raw: unknown): string | null | undefined {
+	if (raw === null) {
+		return null;
+	}
+	if (typeof raw === 'string') {
+		return raw;
+	}
+	return undefined;
+}
+
+/** Read the produced output-token count from `usage.output` OR `usage.output_tokens`. */
+function readOutputTokens(raw: unknown): number | undefined {
+	if (typeof raw !== 'object' || raw === null) {
+		return undefined;
+	}
+	const usage = raw as Record<string, unknown>;
+	const value = usage.output ?? usage.output_tokens;
+	return typeof value === 'number' ? value : undefined;
 }
 
 export interface SessionTailerOptions {

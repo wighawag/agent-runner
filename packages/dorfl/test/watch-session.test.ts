@@ -5,6 +5,8 @@ import {fileURLToPath} from 'node:url';
 import {
 	formatWatchEvent,
 	lastAssistantText,
+	lastAssistantTurn,
+	isOutputCappedTurn,
 	SessionTailer,
 } from '../src/watch-session.js';
 import {makeScratch, type Scratch} from './helpers/gitRepo.js';
@@ -587,5 +589,97 @@ describe('SessionTailer — concurrent tail of a GROWING session .jsonl', () => 
 		);
 		await tailer.stop(); // the final drain must surface it.
 		expect(surfaced).toEqual(['late', '✓ agent finished']);
+	});
+});
+
+describe('lastAssistantTurn — stop_reason + usage (the output-cap signal)', () => {
+	/** One assistant record carrying stop_reason + usage. */
+	function turn(
+		text: string,
+		extra: {stop_reason?: unknown; usage?: unknown} = {},
+	): string {
+		return (
+			JSON.stringify({
+				type: 'message',
+				message: {
+					role: 'assistant',
+					content: [{type: 'text', text}],
+					...extra,
+				},
+			}) + '\n'
+		);
+	}
+
+	it("returns the text + the last turn's stop_reason + usage.output_tokens", () => {
+		const log =
+			turn('first', {stop_reason: 'end_turn', usage: {output: 10}}) +
+			turn('final', {stop_reason: 'max_tokens', usage: {output_tokens: 16384}});
+		const t = lastAssistantTurn(log);
+		expect(t.text).toBe('final');
+		expect(t.stopReason).toBe('max_tokens');
+		expect(t.outputTokens).toBe(16384);
+		// lastAssistantText still returns just the text (backward compat).
+		expect(lastAssistantText(log)).toBe('final');
+	});
+
+	it('reads `usage.output` (the pi-session shape) OR `usage.output_tokens`', () => {
+		const a = turn('a', {usage: {output: 4096}});
+		expect(lastAssistantTurn(a).outputTokens).toBe(4096);
+		const b = turn('b', {usage: {output_tokens: 8192}});
+		expect(lastAssistantTurn(b).outputTokens).toBe(8192);
+	});
+
+	it('treats stop_reason null/None as a cap signal (the truncated-turn shape)', () => {
+		expect(isOutputCappedTurn({stopReason: null, outputTokens: 16384})).toBe(
+			true,
+		);
+		// `None` (the string pi emits) is also a cap signal.
+		expect(isOutputCappedTurn({stopReason: 'None', outputTokens: 16384})).toBe(
+			true,
+		);
+		// `max_tokens` (the standard API cap) is a cap signal.
+		expect(
+			isOutputCappedTurn({stopReason: 'max_tokens', outputTokens: 16384}),
+		).toBe(true);
+	});
+
+	it('a natural turn-end (end_turn / tool_use) is NOT a cap signal', () => {
+		expect(
+			isOutputCappedTurn({stopReason: 'end_turn', outputTokens: 100}),
+		).toBe(false);
+		expect(
+			isOutputCappedTurn({stopReason: 'tool_use', outputTokens: 100}),
+		).toBe(false);
+	});
+
+	it('a cap signal with NO produced tokens is NOT a cap (nothing was emitted)', () => {
+		expect(isOutputCappedTurn({stopReason: null, outputTokens: 0})).toBe(false);
+		expect(
+			isOutputCappedTurn({stopReason: null, outputTokens: undefined}),
+		).toBe(false);
+	});
+
+	it('detects the cap-truncation shape end-to-end from a session log', () => {
+		// A run that ended with stop_reason null + usage.output 16384 (the
+		// reproduced defect's transcript shape).
+		const log = turn('{"verdict": "block", "findings": [', {
+			stop_reason: null,
+			usage: {output: 16384},
+		});
+		const t = lastAssistantTurn(log);
+		expect(isOutputCappedTurn(t)).toBe(true);
+		expect(t.outputTokens).toBe(16384);
+		expect(t.stopReason).toBeNull();
+		// And the text itself is the truncated (unparseable) body.
+		expect(t.text).not.toMatch(/\}/);
+	});
+
+	it('a turn with no stop_reason/usage yields undefined signals (not a cap)', () => {
+		const log = turn('answer'); // no stop_reason/usage
+		const t = lastAssistantTurn(log);
+		expect(t.text).toBe('answer');
+		expect(t.stopReason).toBeUndefined();
+		expect(t.outputTokens).toBeUndefined();
+		expect(isOutputCappedTurn(t)).toBe(false);
 	});
 });

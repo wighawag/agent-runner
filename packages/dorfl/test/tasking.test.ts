@@ -19,6 +19,10 @@ import type {
 	TaskReviewGate,
 	TaskReviewVerdict,
 } from '../src/tasker-review-loop.js';
+import {
+	ReviewOutputCappedError,
+	ReviewParseError,
+} from '../src/review-verdict.js';
 
 /**
  * `do prd:<slug>` tasking-path tests (`performTask`, task `autoslice-command`).
@@ -1004,6 +1008,135 @@ describe('performTask — the tasker review→edit→converge loop', () => {
 		const child = showArbiter(repo, 'work/tasks/backlog/child.md');
 		expect(child).toMatch(/needsAnswers: true/);
 		expect(child).toMatch(/own flag/);
+	});
+});
+
+// --- The review-LEG-FAILURE bounce (observation tasker-review-edits-payload-caps-the-verdict-response) ---
+
+describe('performTask — the review leg failure bounce (cap-truncation + parse failure)', () => {
+	it('a cap-truncated review verdict RELEASES the lock, writes a sidecar naming the cap, and PERSISTS the candidate tasks (does not crash + leave the lock held)', async () => {
+		const {repo} = seedRepoWithArbiter(scratch.root, []);
+		seedPrd(repo, 'it');
+		// The review gate throws the NAMED cap-truncation error (what
+		// harnessTaskReviewGate throws on a response truncated at the output cap).
+		const gate: TaskReviewGate = async () => {
+			throw new ReviewOutputCappedError(16384);
+		};
+		const result = await performTask({
+			slug: 'it',
+			cwd: repo,
+			arbiter: ARBITER,
+			autoTask: true,
+			integration: 'merge',
+			dorfl: taskingAgent('child'),
+			reviewLoop: gate,
+			taskerLoopMax: 3,
+			env: gitEnv(),
+		});
+		// A clean park-for-human is a SUCCESS terminal (exit 0), not a crash.
+		expect(result.exitCode).toBe(0);
+		expect(result.outcome).toBe('needs-attention');
+		// The NAMED failure: the message identifies the cap + token count, NOT a
+		// generic "produced no parseable result".
+		expect(result.message).toMatch(/hit the model output cap \(16384 tokens\)/);
+		expect(result.message).not.toMatch(/no parseable/);
+		// The lock was RELEASED (the documented bounce), not left held — the
+		// pre-fix bug needed a hand `dorfl release-lock` to clear it.
+		const entry = await readItemLock({
+			item: 'spec:it',
+			cwd: repo,
+			arbiter: ARBITER,
+			env: gitEnv(),
+		});
+		expect(entry).toBeUndefined();
+		// The question sidecar was WRITTEN on <arbiter>/main (the documented bounce;
+		// the pre-fix path wrote none) and NAMES the cap-truncation.
+		run('git', ['fetch', '-q', ARBITER], repo, {env: gitEnv()});
+		const sidecar = run(
+			'git',
+			['show', `${ARBITER}/main:work/questions/spec-it.md`],
+			repo,
+			{env: gitEnv()},
+		).stdout;
+		expect(sidecar).toMatch(/hit the model output cap \(16384 tokens\)/);
+		expect(sidecar).toMatch(/STRUCTURAL cap-truncation/);
+		// No guessed tasks were landed (the spec is parked, not tasked).
+		expect(onArbiter(repo, 'work/specs/tasked/it.md')).toBe(false);
+		expect(onArbiter(repo, 'work/specs/ready/it.md')).toBe(true);
+		// The candidate tasks the tasker PRODUCED were PERSISTED (not discarded) —
+		// committed on the local work branch for recovery (the bounce is treeless,
+		// so the run is still on `work/spec-it`).
+		const candidateOnBranch = run(
+			'git',
+			['show', 'work/spec-it:work/tasks/backlog/child.md'],
+			repo,
+			{env: gitEnv()},
+		);
+		expect(candidateOnBranch.status).toBe(0);
+		expect(candidateOnBranch.stdout).toMatch(/## Prompt/);
+		// And the sidecar notes the candidate tasks are saved for recovery.
+		expect(sidecar).toMatch(/saved on the work branch/);
+	});
+
+	it('a GENERIC parse failure (no cap signal) still bounces + names it as a parse failure (never a silent approve)', async () => {
+		const {repo} = seedRepoWithArbiter(scratch.root, []);
+		seedPrd(repo, 'it');
+		const gate: TaskReviewGate = async () => {
+			throw new ReviewParseError(
+				'review agent produced no parseable {verdict, findings} result',
+			);
+		};
+		const result = await performTask({
+			slug: 'it',
+			cwd: repo,
+			arbiter: ARBITER,
+			autoTask: true,
+			dorfl: taskingAgent('child'),
+			reviewLoop: gate,
+			taskerLoopMax: 3,
+			env: gitEnv(),
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.outcome).toBe('needs-attention');
+		// Named as a parse failure, NOT a cap (no false cap claim without a signal).
+		expect(result.message).toMatch(/no parseable/);
+		expect(result.message).not.toMatch(/output cap/);
+		// Lock released + sidecar written.
+		const entry = await readItemLock({
+			item: 'spec:it',
+			cwd: repo,
+			arbiter: ARBITER,
+			env: gitEnv(),
+		});
+		expect(entry).toBeUndefined();
+		run('git', ['fetch', '-q', ARBITER], repo, {env: gitEnv()});
+		const sidecar = run(
+			'git',
+			['show', `${ARBITER}/main:work/questions/spec-it.md`],
+			repo,
+			{env: gitEnv()},
+		).stdout;
+		expect(sidecar).toMatch(/no parseable/);
+	});
+
+	it('a NON-review throw (a genuine wiring error) is RE-THROWN, not silently bounced', async () => {
+		const {repo} = seedRepoWithArbiter(scratch.root, []);
+		seedPrd(repo, 'it');
+		const gate: TaskReviewGate = async () => {
+			throw new Error('genuine wiring blow-up');
+		};
+		await expect(
+			performTask({
+				slug: 'it',
+				cwd: repo,
+				arbiter: ARBITER,
+				autoTask: true,
+				dorfl: taskingAgent('child'),
+				reviewLoop: gate,
+				taskerLoopMax: 3,
+				env: gitEnv(),
+			}),
+		).rejects.toThrow('genuine wiring blow-up');
 	});
 });
 

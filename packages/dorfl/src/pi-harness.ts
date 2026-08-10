@@ -12,7 +12,7 @@ import {
 	type LaunchResult,
 } from './harness.js';
 import {generateSessionPath} from './session-path.js';
-import {lastAssistantText} from './watch-session.js';
+import {lastAssistantTurn, isOutputCappedTurn} from './watch-session.js';
 import {reapProcessGroup} from './reap-agent-tree.js';
 import type {HarnessAdapter} from './config.js';
 
@@ -188,8 +188,10 @@ export class PiHarness implements Harness {
 			detail: status === 0 ? undefined : (result.stderr ?? '').trim(),
 			// The agent's ANSWER (task `harness-agent-output`): the LAST assistant
 			// turn's text read from the session `.jsonl` pi just wrote — NOT piped
-			// stdout (which is drained). Shares `watch-session.ts`'s reader.
-			output: readLastAssistantText(sessionFile),
+			// stdout (which is drained). Shares `watch-session.ts`'s reader. The
+			// same turn's stop_reason/usage feed the outputCapped cap-truncation
+			// signal (observation `tasker-review-edits-payload-caps-the-verdict-response`).
+			...readAssistantOutput(sessionFile),
 		};
 	}
 
@@ -384,9 +386,10 @@ export class PiHarness implements Harness {
 						timedOut: timedOut ? true : undefined,
 						...(reap ? {reap} : {}),
 						// Read the agent's ANSWER from the `.jsonl` at `exit` — the same
-						// last-assistant-text read `launch` does at return (task
+						// last-assistant-turn read `launch` does at return (task
 						// `harness-agent-output`); the process has exited so the log is final.
-						output: readLastAssistantText(sessionFile),
+						// The same turn's stop_reason/usage feed the outputCapped signal.
+						...readAssistantOutput(sessionFile),
 					});
 				};
 				if (!timedOut || pgid === undefined) {
@@ -523,14 +526,18 @@ export function piSessionExists(record: HarnessRecord): boolean {
 }
 
 /**
- * Read the LAST assistant message's text from the pi session `.jsonl` at
- * `sessionFile` — the agent's final ANSWER, surfaced as `LaunchResult.output`
- * (task `harness-agent-output`). Called by BOTH `launch` (at return) and
- * `launchAsync` (at `close`), AFTER pi has exited so the log is complete.
+ * Read the LAST assistant turn's output from the pi session `.jsonl` at
+ * `sessionFile` — the agent's final ANSWER (`output`) PLUS the output-cap
+ * signal (`outputCapped`, when the turn was truncated at the model's output-token
+ * cap before it finished). Surfaced through the harness seam as
+ * `LaunchResult.output` / `LaunchResult.outputCapped` (task `harness-agent-output`;
+ * observation `tasker-review-edits-payload-caps-the-verdict-response`). Called by
+ * BOTH `launch` (at return) and `launchAsync` (at `exit`), AFTER pi has exited so
+ * the log is complete.
  *
- * It REUSES `watch-session.ts`'s {@link lastAssistantText} (one `.jsonl` parser,
- * not two). An absent file (pi never wrote it) yields `undefined`, as does a log
- * with no assistant text — a read error is never thrown back into the launch.
+ * It REUSES `watch-session.ts`'s {@link lastAssistantTurn} (one `.jsonl` parser,
+ * not two). An absent file (pi never wrote it) yields `{}`, as does a log with no
+ * assistant text — a read error is never thrown back into the launch.
  *
  * Studied (task `pi-harness-polish`, finding
  * `work/notes/findings/pi-harness-channels.md`, pinned against pi 0.73.1 +
@@ -543,14 +550,21 @@ export function piSessionExists(record: HarnessRecord): boolean {
  * so a future stream/HTTP-shaped harness (opencode-style) still fits: the file
  * shape lives BEHIND this reader and is not observable through the seam.
  */
-function readLastAssistantText(sessionFile: string): string | undefined {
+function readAssistantOutput(sessionFile: string): {
+	output?: string;
+	outputCapped?: number;
+} {
 	let jsonl: string;
 	try {
 		jsonl = readFileSync(sessionFile, 'utf8');
 	} catch {
-		return undefined; // no session log on disk — no answer to surface.
+		return {}; // no session log on disk — no answer to surface.
 	}
-	return lastAssistantText(jsonl);
+	const turn = lastAssistantTurn(jsonl);
+	return {
+		output: turn.text,
+		outputCapped: isOutputCappedTurn(turn) ? turn.outputTokens : undefined,
+	};
 }
 
 // Register the pi adapter so `status`/`do`/`gc` resolve liveness for `pi` jobs

@@ -1,4 +1,4 @@
-import {readFileSync, readdirSync, writeFileSync} from 'node:fs';
+import {readFileSync, readdirSync, writeFileSync, rmSync} from 'node:fs';
 import {join} from 'node:path';
 import {
 	workFolderPrefix,
@@ -12,6 +12,7 @@ import {launchWithOptionalWatch} from './agent-launch.js';
 import {
 	parseReviewVerdict,
 	ReviewParseError,
+	ReviewOutputCappedError,
 	reviewDisciplinePrompt,
 	verdictContractPrompt,
 	type ReviewFinding,
@@ -26,6 +27,20 @@ import {
 // `review-protocol-doc-and-shared-machinery`).
 export type {TaskEdit, UncertainTask} from './review-verdict.js';
 export {parseReviewVerdict as parseTaskReviewVerdict} from './review-verdict.js';
+export {ReviewOutputCappedError as TaskReviewOutputCappedError} from './review-verdict.js';
+
+/**
+ * The SCRATCH directory the review agent writes full-replacement task bodies to
+ * (the DECOUPLED edits channel — see {@link TaskEdit.src}). Sibling of `backlog/`
+ * under `work/tasks/`; NOT a {@link WorkFolderKey}, so it is never scanned by
+ * {@link newOrChangedBacklog} (which reads `work/tasks/backlog/` only) and never
+ * appears as a candidate task. The runner reads each `src` file, applies it to the
+ * target `work/tasks/backlog/<name>.md` through the SAME scope fence, then DELETES
+ * it — so the integrate's `git add -A` never sweeps the scratch into the commit. A
+ * start-of-loop clean (see {@link cleanReviewEditsScratch}) reaps any stragglers a
+ * crashed prior run left behind.
+ */
+export const REVIEW_EDITS_SCRATCH_DIR = 'work/tasks/.review-edits';
 
 /**
  * **The tasker review→edit→re-review→converge LOOP** (`slicer-review-edit-loop`,
@@ -247,6 +262,10 @@ export async function runTaskReviewLoop(
 	// tasks, never pre-existing landed ones (the requeue fix). No snapshot ⇒ an
 	// empty one (the legacy whole-directory behaviour for the empty-backlog case).
 	const before = options.before ?? new Map<string, string>();
+	// Reap any review-edits SCRATCH a crashed prior run left behind, so the
+	// integrate's `git add -A` never sweeps stragglers into this run's commit. The
+	// loop deletes each `src` it applies too; this is the crash-recovery backstop.
+	cleanReviewEditsScratch(options.cwd);
 
 	let totalPasses = 0;
 	let last: SingleExecutionResult | undefined;
@@ -456,6 +475,15 @@ function applyEdits(
 			);
 			continue;
 		}
+		// Resolve the edit BODY: inline `content` (legacy / small edits) OR a `src`
+		// scratch file the agent wrote (the decoupled form — see TaskEdit.src). The
+		// `src` form keeps the verdict JSON bounded by the NUMBER of edits, not the
+		// total body size, so a large decomposition can no longer cap-truncate the
+		// verdict. A path-only edit with no resolvable body is a no-op marker.
+		const body = resolveEditBody(cwd, edit, note);
+		if (body === undefined) {
+			continue;
+		}
 		// A pre-existing task this run did NOT touch must not be overwritten: it is
 		// in `before` and the current on-disk content still equals the snapshot.
 		if (before.has(filename)) {
@@ -475,7 +503,70 @@ function applyEdits(
 			}
 		}
 		const abs = join(cwd, normalized);
-		writeFileSync(abs, edit.content);
+		writeFileSync(abs, body);
+	}
+}
+
+/**
+ * Resolve an edit's full-replacement BODY: inline `content` (legacy) takes
+ * precedence, else read the `src` scratch file the agent wrote. Returns
+ * `undefined` when there is no body to apply (neither channel present, or `src`
+ * missing / outside the scratch fence / unreadable). The `src` is fenced to
+ * {@link REVIEW_EDITS_SCRATCH_DIR} (no `..`) so the agent cannot pull an arbitrary
+ * repo file in as the edit body. A read `src` is DELETED after reading so the
+ * integrate's `git add -A` never sweeps the scratch into the commit.
+ */
+function resolveEditBody(
+	cwd: string,
+	edit: TaskEdit,
+	note: (message: string) => void,
+): string | undefined {
+	if (edit.content !== undefined) {
+		return edit.content;
+	}
+	if (edit.src === undefined) {
+		return undefined;
+	}
+	const src = edit.src.replace(/\\/g, '/');
+	if (src.includes('..') || !src.startsWith(REVIEW_EDITS_SCRATCH_DIR + '/')) {
+		note(
+			`Skipped a review edit whose src is outside ${REVIEW_EDITS_SCRATCH_DIR}/ (${edit.src}) — ` +
+				'the scratch body must live under the review-edits scratch dir.',
+		);
+		return undefined;
+	}
+	const srcAbs = join(cwd, src);
+	let body: string | undefined;
+	try {
+		body = readFileSync(srcAbs, 'utf8');
+	} catch {
+		note(
+			`Skipped a review edit whose src scratch file is missing/unreadable (${edit.src}) — ` +
+				'the agent did not write it before emitting the verdict.',
+		);
+		return undefined;
+	}
+	// Reap the scratch file now the body is in hand — never let it survive to the
+	// integrate's `git add -A` (best-effort; a missing file is already gone).
+	try {
+		rmSync(srcAbs, {force: true});
+	} catch {
+		// Best-effort: a failure to delete does not block the apply.
+	}
+	return body;
+}
+
+/**
+ * Best-effort reap of the {@link REVIEW_EDITS_SCRATCH_DIR} (a crashed prior run may
+ * have left scratch bodies behind; the integrate's `git add -A` would otherwise
+ * sweep them into the next tasking commit). Called at the START of a loop run.
+ * Never throws — a missing/unreadable dir is the normal steady state.
+ */
+function cleanReviewEditsScratch(cwd: string): void {
+	try {
+		rmSync(join(cwd, REVIEW_EDITS_SCRATCH_DIR), {recursive: true, force: true});
+	} catch {
+		// Best-effort.
 	}
 }
 
@@ -600,7 +691,28 @@ export function harnessTaskReviewGate(
 				}`,
 			);
 		}
-		return parseReviewVerdict(readOutput(launched.output));
+		// CAP-TRUNCATION NAMING (observation
+		// `tasker-review-edits-payload-caps-the-verdict-response`): attempt the parse
+		// FIRST so a verdict that DID complete (even on a capped turn — e.g. the cap
+		// hit trailing prose after the JSON closed) is HONORED, not discarded. Only
+		// when the parse FAILS AND the adapter surfaced an output-cap signal do we
+		// re-throw the NAMED {@link ReviewOutputCappedError} (a subclass of
+		// ReviewParseError, so the bounce routing still catches it — NEVER a silent
+		// approve). A parse failure with no cap signal stays the generic
+		// ReviewParseError (the adapter could not see the signal — still
+		// needs-attention, still never a silent approve).
+		try {
+			return parseReviewVerdict(readOutput(launched.output));
+		} catch (err) {
+			if (
+				launched.outputCapped !== undefined &&
+				(err instanceof ReviewParseError ||
+					err instanceof ReviewOutputCappedError)
+			) {
+				throw new ReviewOutputCappedError(launched.outputCapped);
+			}
+			throw err;
+		}
 	};
 }
 
@@ -634,16 +746,26 @@ export function buildTaskReviewPrompt(input: TaskReviewGateInput): string {
 		`loop, not a one-shot gate.`,
 		``,
 		`This is review pass ${input.pass} (fresh context ${input.execution}). You`,
-		`do NOT edit files or run git yourself — you EMIT the edits to apply as FULL`,
-		`replacement content and the runner applies them, then re-reviews. Tasks`,
+		`do NOT run git. For the EDITS, WRITE each full-replacement task body to a`,
+		`SCRATCH file under ${REVIEW_EDITS_SCRATCH_DIR}/ and reference it by path in the`,
+		`"edits" channel — do NOT inline the body in the JSON, and do NOT edit the`,
+		`candidate task files directly (the runner applies your scratch body to the`,
+		`candidate task through its scope fence + deletes the scratch; on a review`,
+		`failure the tasker's original candidates stay pristine for recovery). This`,
+		`keeps the verdict JSON bounded by the NUMBER of edits, not the total body size,`,
+		`so a large decomposition cannot cap-truncate the verdict. Tasks`,
 		`measurably keep improving when reviewed, so propose edits that fix the`,
 		`findings; converge when a pass finds NO NEW blocking issue.`,
 		``,
 		verdictContractPrompt(),
 		``,
 		`Fill the channels appropriate to THIS caller (the tasker improver loop):`,
-		`  - "edits" — full-content replacements for candidate task files when you`,
-		`    can FIX a finding by editing (the natural improver step).`,
+		`  - "edits" — for each candidate task file you want to rewrite, WRITE the full`,
+		`    replacement body to ${REVIEW_EDITS_SCRATCH_DIR}/<name>.md (the runner reads`,
+		`    it, applies it to work/tasks/backlog/<name>.md, then deletes the scratch),`,
+		`    and emit {"path": "work/tasks/backlog/<name>.md", "src": "${REVIEW_EDITS_SCRATCH_DIR}/<name>.md"}.`,
+		`    Do NOT put the body in "content" — that shares the capped response with`,
+		`    the verdict and cap-truncates it on a large set.`,
 		`  - "uncertainTasks" — specific tasks you cannot make buildable (each gets`,
 		`    \`needsAnswers: true\` with the questions in its body).`,
 		`  - "decompositionUnclear" — the WHOLE decomposition is unsound (the spec is`,
