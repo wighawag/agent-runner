@@ -4,9 +4,11 @@ import {mkdirSync, writeFileSync, existsSync, readFileSync} from 'node:fs';
 import {
 	applyAnsweredQuestions,
 	ApplyPersistError,
+	hasAppliedAnswersRecord,
 	resolveItemPathByIdentity,
 	OPEN_QUESTIONS_MARKER_OPEN,
 	OPEN_QUESTIONS_MARKER_CLOSE,
+	TRIAGED_RESOLVE,
 } from '../src/apply-persist.js';
 import {
 	newSidecar,
@@ -205,6 +207,125 @@ describe('applyAnsweredQuestions — append / re-pause (new questions discovered
 		expect(model.entries[1].answer).toBe('');
 		expect(readFileSync(join(repo, sidecarPath), 'utf8')).toMatch(
 			/allAnswered=false/,
+		);
+	});
+});
+
+// ADR `resolve-settles-the-question-loop-not-the-note`: the resolve-fully path
+// KEEPS an observation in the inbox, so it must also stamp the `triaged:` settled
+// marker — otherwise the kept note's two classifier signals (`needsAnswers:false`
+// + no sidecar) are indistinguishable from a NEVER-triaged note and the triage
+// rung re-asks the same engine-built question forever.
+describe('applyAnsweredQuestions — resolve-fully stamps the `triaged:` settled marker on a KEPT note', () => {
+	it('an OBSERVATION resolved fully is stamped `triaged: resolve` in the SAME commit as the cleared flag + deleted sidecar', () => {
+		const {repo, itemPath, sidecarPath} = seed({
+			slug: 'kept',
+			folder: 'observations',
+			type: 'observation',
+			questions: ['what becomes of this signal?'],
+			answers: ['ratified — keep it as the standing record'],
+		});
+
+		const result = applyAnsweredQuestions({
+			cwd: repo,
+			item: 'observation:kept',
+			itemPath,
+			env: gitEnv(),
+		});
+
+		expect(result.outcome).toBe('resolved');
+		const body = readFileSync(join(repo, itemPath), 'utf8');
+		// The note is RETAINED, its answers harvested, and it now rests SETTLED: the
+		// marker + the cleared flag + the deleted sidecar are ONE commit, so no tick
+		// can observe a torn "kept but still untriaged" state.
+		expect(existsSync(join(repo, itemPath))).toBe(true);
+		expect(existsSync(join(repo, sidecarPath))).toBe(false);
+		expect(parseFrontmatter(body).triaged).toBe(TRIAGED_RESOLVE);
+		expect(parseFrontmatter(body).needsAnswers).toBe(false);
+		expect(body).toContain('## Applied answers');
+		const touched = filesInHeadCommit(repo);
+		expect(touched).toContain(itemPath);
+		expect(touched).toContain(sidecarPath);
+	});
+
+	it('a fence-less OBSERVATION (the shape `capture-signal` writes) gets a fence carrying the marker', () => {
+		const {repo, itemPath} = seed({
+			slug: 'fenceless',
+			folder: 'observations',
+			type: 'observation',
+			questions: ['what becomes of this signal?'],
+			answers: ['keep on record'],
+		});
+		// Rewrite the seeded item as bare prose (no frontmatter fence at all).
+		writeFileSync(join(repo, itemPath), '# A captured signal\n\nprose only.\n');
+		gitIn(['add', '-A'], repo);
+		gitIn(['commit', '-q', '-m', 'fence-less note'], repo);
+
+		applyAnsweredQuestions({
+			cwd: repo,
+			item: 'observation:fenceless',
+			itemPath,
+			env: gitEnv(),
+		});
+
+		const fm = parseFrontmatter(readFileSync(join(repo, itemPath), 'utf8'));
+		expect(fm.triaged).toBe(TRIAGED_RESOLVE);
+		expect(fm.needsAnswers).toBe(false);
+	});
+
+	it('a TASK resolved fully is NOT stamped — its status is its FOLDER, and it has no triage rung to re-ask it', () => {
+		const {repo, itemPath} = seed({
+			slug: 'wi',
+			type: 'task',
+			questions: ['which shape?'],
+			answers: ['the second one'],
+		});
+
+		applyAnsweredQuestions({
+			cwd: repo,
+			item: 'task:wi',
+			itemPath,
+			env: gitEnv(),
+		});
+
+		const fm = parseFrontmatter(readFileSync(join(repo, itemPath), 'utf8'));
+		expect(fm.triaged).toBeUndefined();
+		expect(fm.needsAnswers).toBe(false);
+	});
+
+	it('a RE-PAUSE does NOT stamp — the loop is still open, so the note is not settled', () => {
+		const {repo, itemPath} = seed({
+			slug: 'still-open',
+			folder: 'observations',
+			type: 'observation',
+			questions: ['what becomes of this signal?'],
+			answers: ['not sure yet'],
+		});
+
+		applyAnsweredQuestions({
+			cwd: repo,
+			item: 'observation:still-open',
+			itemPath,
+			appendQuestions: [{question: 'then which part is unclear?'}],
+			env: gitEnv(),
+		});
+
+		const fm = parseFrontmatter(readFileSync(join(repo, itemPath), 'utf8'));
+		expect(fm.triaged).toBeUndefined();
+		expect(fm.needsAnswers).toBe(true);
+	});
+
+	it('`hasAppliedAnswersRecord` recognises the engine-written record (the legacy back-fill trigger) and nothing else', () => {
+		expect(hasAppliedAnswersRecord('## Applied answers 2026-08-11\n\nx')).toBe(
+			true,
+		);
+		expect(hasAppliedAnswersRecord('a\r\n## Applied answers\r\nb')).toBe(true);
+		expect(hasAppliedAnswersRecord('prose mentioning applied answers')).toBe(
+			false,
+		);
+		// Not a heading (inline / deeper level) ⇒ not the engine's record.
+		expect(hasAppliedAnswersRecord('see the ## Applied answers block')).toBe(
+			false,
 		);
 	});
 });

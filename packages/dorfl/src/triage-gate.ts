@@ -26,8 +26,10 @@ import {extractJsonObjectSpan} from './verdict-json.js';
  *   - `map` — an UNAMBIGUOUS map onto an existing item → DISCHARGE the redundant
  *     note BY DELETION too (it is already covered by the item it maps onto, so it
  *     carries no unique signal; the mapping is recorded in the commit message).
- *     There is no resting `triaged:keep` state any more (task
- *     `agentic-apply-retire-disposition-vocabulary`).
+ *     An AUTO disposition never RESTS a note (task
+ *     `agentic-apply-retire-disposition-vocabulary`); the one path that KEEPS a
+ *     note is the human-answered `resolve` verdict on the apply rung (ADR
+ *     `resolve-settles-the-question-loop-not-the-note`).
  *
  * It is the DIRECT mirror of `surface-gate.ts`'s spawn→emit→parse seam, with a
  * narrower emitted payload (`{auto, …}` rather than `{questions}`). Production

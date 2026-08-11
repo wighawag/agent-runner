@@ -6,6 +6,7 @@ import type {SurfaceGate, SurfaceEmit} from '../src/surface-gate.js';
 import type {ApplyDecider} from '../src/apply-decide.js';
 import type {DecisionVerdict} from '../src/decision-engine.js';
 import {parseSidecar} from '../src/sidecar.js';
+import {parseFrontmatter} from '../src/frontmatter.js';
 import {
 	newSidecar,
 	serialiseSidecar,
@@ -310,6 +311,73 @@ describe('advance triage — ALWAYS surfaces a deterministic triage question (no
 		expect(
 			existsSync(join(repo, 'work', 'questions', 'observation-settled.md')),
 		).toBe(false);
+	});
+
+	// ADR `resolve-settles-the-question-loop-not-the-note` — the LEGACY arm. Notes
+	// resolved-and-KEPT before the apply rung stamped `triaged:` still rest with NO
+	// marker, which is byte-identical (to the classifier) to a never-triaged note.
+	// They carry the ENGINE-WRITTEN `## Applied answers` record, which is proof the
+	// engine already applied a human's answers, so the triage rung back-stamps the
+	// marker instead of re-asking a question the human has already answered.
+	it('a LEGACY resolved-and-kept note (`## Applied answers`, no `triaged:` marker) ⇒ back-stamped + no-op, NOT re-asked', async () => {
+		const {repo, itemPath} = seedRepoWith('legacy-resolved');
+		// Reproduce the pre-fix end-state exactly: needsAnswers cleared, no sidecar,
+		// answers harvested into the body, and NO `triaged:` marker.
+		writeFileSync(
+			join(repo, itemPath),
+			[
+				'---',
+				'title: legacy-resolved',
+				'needsAnswers: false',
+				'---',
+				'',
+				'A standing record of a known gap.',
+				'',
+				'## Applied answers 2026-08-11',
+				'',
+				'### q1: What should become of this observation?',
+				'',
+				'Keep (resolve, note stays) — it is the only record of these choices.',
+				'',
+			].join('\n'),
+		);
+		gitIn(['add', '-A'], repo);
+		gitIn(['commit', '-q', '-m', 'legacy resolved-and-kept note'], repo);
+		const {gate, spawns} = spySurface({emit: {questions: []}});
+
+		const result = await performAdvance({
+			arg: 'obs:legacy-resolved',
+			cwd: repo,
+			surfaceGate: gate,
+			acquireLock: async () => ACQUIRED,
+			releaseLock: async () => RELEASED,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.outcome).toBe('no-op');
+		expect(spawns).toEqual([]);
+		// No question was surfaced — and the note now carries the marker, so the NEXT
+		// tick drops it at the pool (this arm can never fire twice).
+		expect(
+			existsSync(
+				join(repo, 'work', 'questions', 'observation-legacy-resolved.md'),
+			),
+		).toBe(false);
+		const body = readFileSync(join(repo, itemPath), 'utf8');
+		expect(parseFrontmatter(body).triaged).toBe('resolve');
+		// The stamp is committed (not left dirty), so the tree-less publish carries it.
+		expect(gitIn(['status', '--porcelain'], repo).trim()).toBe('');
+
+		// And it is IDEMPOTENT: a second tick finds the marker and stays a no-op.
+		const again = await performAdvance({
+			arg: 'obs:legacy-resolved',
+			cwd: repo,
+			surfaceGate: gate,
+			acquireLock: async () => ACQUIRED,
+			releaseLock: async () => RELEASED,
+		});
+		expect(again.outcome).toBe('no-op');
+		expect(spawns).toEqual([]);
 	});
 });
 

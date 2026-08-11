@@ -42,17 +42,26 @@ import {workItemRel} from './work-layout.js';
  *     hard-deleted from here — dispose is the only path off the board; OR
  *   - **resolve fully** (the default) — clear `needsAnswers` + DELETE the sidecar
  *     in the SAME atomic commit (the invariant `needsAnswers:false ⟺ no active
- *     sidecar`); the item advances toward build by its normal lifecycle.
+ *     sidecar`); the item advances toward build by its normal lifecycle. For an
+ *     OBSERVATION this ALSO stamps the `triaged:` settled marker (see
+ *     {@link TRIAGED_RESOLVE}) in that same commit — the note is KEPT, so it needs
+ *     a durable record that its triage question-loop is CLOSED or the triage rung
+ *     re-asks it forever (ADR `resolve-settles-the-question-loop-not-the-note`).
  *
  * **The disposition vocabulary is GONE** (task
  * `agentic-apply-retire-disposition-vocabulary`): the apply rung no longer reads a
- * per-entry `disposition=` token, no longer runs a most-decisive picker, and has
- * no `keep`/`triaged:keep` resting state. A sidecar entry is BINARY (no-answer |
- * answered); what to DO with a fully-answered OBSERVATION is decided by the
- * AGENTIC apply decision in the advance tick (`advance.ts` `applyRung` over the
- * shared `decide` engine), which then routes here (re-pause / dispose / via
- * `promoteObservation` for a mint). A signal is still-open, acted-on, or deleted
- * — there is no \"retain as resolved\" state.
+ * per-entry `disposition=` token and no longer runs a most-decisive picker. A
+ * sidecar entry is BINARY (no-answer | answered); what to DO with a fully-answered
+ * OBSERVATION is decided by the AGENTIC apply decision in the advance tick
+ * (`advance.ts` `applyRung` over the shared `decide` engine), which then routes
+ * here (re-pause / dispose / resolve / via `promoteObservation` for a mint).
+ *
+ * What the retirement removed was the human-stamped `disposition=`/`promote-*`
+ * TOKEN vocabulary, NOT the settled AXIS: a note that the `resolve` verdict KEEPS
+ * still rests as `triaged: resolve` + `needsAnswers:false` + no sidecar. That is
+ * the one resting state a note has, and it says "the question-loop is settled",
+ * NOT "the signal is finished" (a finished signal is `dispose`d — it leaves the
+ * inbox by deletion).
  *
  * The work-item (task/spec) terminal MOVES (`tasks/cancelled`, `specs/dropped`) and
  * the stuck (lock `state: stuck`) LIFECYCLE state are a SEPARATE lifecycle concern (a
@@ -88,6 +97,32 @@ export {APPLY_LIFECYCLE_FOLDERS, resolveItemPathByIdentity};
 const APPLIED_HEADING = '## Applied answers';
 
 /**
+ * The `triaged:` settled-marker VALUE the resolve-fully path stamps on a KEPT
+ * OBSERVATION (ADR `resolve-settles-the-question-loop-not-the-note`).
+ *
+ * The `resolve` verdict is the ONE apply terminal that RETAINS an observation in
+ * the inbox. Every other terminal removes it from the triage pool by MOVING or
+ * DELETING the file (mint → `git rm` + the new artifact; dispose → `git rm` /
+ * terminal folder), so only this one needs an in-file record that the note has
+ * been through triage. Without it the resolved note is byte-indistinguishable, to
+ * the classifier's two signals (`needsAnswers` + sidecar), from a note that was
+ * NEVER triaged: `needsAnswers:false` + no sidecar ⇒ ANALYSE ⇒ `triage-observation`
+ * ⇒ the engine-built triage question is surfaced AGAIN, and the human is asked
+ * something they already answered (observed live in the `rocketh` consumer repo:
+ * surface → answer → resolve → the byte-identical question re-surfaced).
+ *
+ * The marker is the axis the READ side already models end-to-end — `frontmatter.ts`
+ * parses it, `ledger-read.ts` carries it, `lifecycle-pools.ts` drops a marked
+ * observation out of the CREATE-side triage pool, and `advance.ts`'s triage rung
+ * no-ops on it for an explicit `obs:<slug>`. Only the WRITER was missing.
+ *
+ * It does NOT strand a later answer: an ANSWERED sidecar dominates the marker (ADR
+ * `answered-observation-sidecar-dominates-triaged-marker`), so a genuinely NEW
+ * question about a settled note still routes to apply and is still answerable.
+ */
+export const TRIAGED_RESOLVE = 'resolve';
+
+/**
  * The STRUCTURAL fence the templates wrap the transient open-questions block in
  * — an HTML-comment marker pair, mirroring the existing `<!-- dorfl-…
  * -->` style in `sidecar.ts`. Apply's reconcile (full-resolution route only)
@@ -107,6 +142,21 @@ const APPLIED_HEADING = '## Applied answers';
  */
 export const OPEN_QUESTIONS_MARKER_OPEN = '<!-- open-questions -->';
 export const OPEN_QUESTIONS_MARKER_CLOSE = '<!-- /open-questions -->';
+
+/**
+ * Does this item body carry the ENGINE-WRITTEN applied-answers record?
+ *
+ * Only {@link applyAnsweredQuestions} writes this heading, and only after a human
+ * answered EVERY open question on the item, so its presence is PROOF the engine
+ * has applied a human's answers here — not a prose heuristic. The triage rung uses
+ * it as the legacy back-fill trigger for notes resolved-and-kept before the
+ * `triaged:` stamp existed (ADR `resolve-settles-the-question-loop-not-the-note`).
+ */
+export function hasAppliedAnswersRecord(body: string): boolean {
+	return new RegExp(`^${APPLIED_HEADING}\\b`, 'm').test(
+		body.replace(/\r\n/g, '\n'),
+	);
+}
 
 export interface ApplyAnsweredQuestionsOptions {
 	/** Working clone/worktree the apply commits in. */
@@ -490,7 +540,10 @@ export function applyAnsweredQuestions(
 	// compatible — no marker ⇒ identical bytes. The re-pause path above is
 	// deliberately untouched (D3): its open-questions block is still open.
 	const reconciledBody = stripOpenQuestionsBlocks(baseBody);
-	const resolvedBody = withAppliedAnswers(reconciledBody, model.entries);
+	const resolvedBody = withTriagedMarkerIfKeptNote(
+		withAppliedAnswers(reconciledBody, model.entries),
+		item,
+	);
 	const result = applyAtomic({
 		cwd,
 		itemPath,
@@ -510,6 +563,30 @@ export function applyAnsweredQuestions(
 		itemPath,
 		message,
 	};
+}
+
+/**
+ * Stamp the `triaged:` settled marker on a resolve-fully body — but ONLY for an
+ * OBSERVATION (the one item type this path KEEPS in a re-scanned inbox).
+ *
+ * Structural, not caller-supplied, so it cannot be forgotten by a future caller:
+ * every route that reaches the resolve-fully branch with an observation identity
+ * has, by definition, just closed that note's question-loop while retaining the
+ * file. A TASK/SPEC is deliberately EXCLUDED — it rests in a lifecycle FOLDER (its
+ * status), is not enumerated from the observation inbox, and has no triage rung to
+ * re-ask it; stamping a triage marker on one would invent a second status axis for
+ * an item whose status is already the folder.
+ *
+ * Idempotent ({@link setFrontmatterMarker} replaces an existing key) and
+ * fence-creating (observations are routinely born fence-less), so re-resolving a
+ * note after a genuinely new question re-stamps rather than duplicating.
+ */
+function withTriagedMarkerIfKeptNote(body: string, item: string): string {
+	const {type} = resolveSidecarIdentity(item);
+	if (type !== 'observation') {
+		return body;
+	}
+	return setFrontmatterMarker(body, 'triaged', TRIAGED_RESOLVE);
 }
 
 interface DisposeInput {

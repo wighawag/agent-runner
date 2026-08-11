@@ -1,4 +1,4 @@
-import {readFileSync} from 'node:fs';
+import {readFileSync, writeFileSync} from 'node:fs';
 import {join} from 'node:path';
 import {run, type RunResult} from './git.js';
 import {workItemRel} from './work-layout.js';
@@ -25,8 +25,12 @@ import {setFrontmatterMarker} from './frontmatter.js';
  *   1. **the conservative auto-disposition** ({@link autoDispositionObservation},
  *      US #17, `observationTriage: 'auto'`-gated): act on the no-question case on
  *      the UNTRIAGED observation in ONE local commit. BOTH no-question cases now
- *      DISCHARGE the redundant note BY DELETION (there is no resting `triaged:keep`
- *      state any more — task `agentic-apply-retire-disposition-vocabulary`):
+ *      DISCHARGE the redundant note BY DELETION — an AUTO disposition never RESTS a
+ *      note, because both of its cases (duplicate / map) are by definition notes
+ *      that carry no unique signal (task `agentic-apply-retire-disposition-
+ *      vocabulary`; the ONE case that does rest a note is the human-answered
+ *      `resolve` verdict on the APPLY rung, see ADR `resolve-settles-the-question-
+ *      loop-not-the-note`):
  *        - `duplicate` → `git rm` the duplicate in a standalone commit, the
  *          duplicated-of identity + reason in the commit message (git history =
  *          archive). A duplicate is a redundant copy of an already-captured signal,
@@ -34,7 +38,6 @@ import {setFrontmatterMarker} from './frontmatter.js';
  *        - `map` → the note is already covered by the existing item it maps onto, so
  *          it is settled — `git rm` it in a standalone commit, the mapped-onto
  *          identity + reason recorded in the commit message (mirroring `duplicate`).
- *          There is no resting `triaged:keep` note any more.
  *   2. **promote → SELF-CONTAINED new-item creation + DELETE through the CAS**
  *      ({@link promoteObservation}, US #1/#3/#8): an ANSWERED "promote" drafts a
  *      new `work/tasks/ready/<new-slug>.md` whose body is built FROM the
@@ -120,6 +123,102 @@ export class TriagePersistError extends Error {
 	}
 }
 
+// --- Back-stamping a KEPT note that was resolved before the marker existed ---
+
+export interface StampTriagedMarkerOptions {
+	/** Working clone/worktree the stamp commits in. */
+	cwd: string;
+	/** The namespaced observation identity (`observation:<slug>`). */
+	item: string;
+	/** The observation file path RELATIVE to `cwd`. */
+	itemPath: string;
+	/** The `triaged:` value to stamp (the apply rung's settled disposition). */
+	value: string;
+	/** Why the stamp is being back-filled (rides the commit message). */
+	reason: string;
+	/** Advisory committer id for the commit subject. Defaults to git user.name. */
+	by?: string;
+	/** Environment for child git processes. */
+	env?: NodeJS.ProcessEnv;
+	/** Sink for human-readable progress notes. */
+	note?: (message: string) => void;
+}
+
+export interface StampTriagedMarkerResult {
+	/** The commit sha the stamp produced, or `undefined` when the body was already marked. */
+	commit?: string;
+	/** A human-readable summary. */
+	message: string;
+}
+
+/**
+ * Stamp the `triaged:` settled marker onto an observation that was ALREADY
+ * resolved-and-kept, in ONE local commit — the SELF-HEALING back-fill for notes
+ * resolved BEFORE the apply rung learned to stamp it (ADR
+ * `resolve-settles-the-question-loop-not-the-note`).
+ *
+ * Why a back-fill exists at all: the fix that makes `resolve` stamp the marker is
+ * forward-only, so every note a repo resolved under the old code still rests
+ * `needsAnswers:false` + no sidecar + NO marker — the exact shape the triage rung
+ * re-asks. Those notes are not hypothetical (a single `rocketh` cycle re-asked
+ * four, with eleven more queued behind them), and they are un-fixable from the
+ * human's side: answering again just resolves again into the same shape.
+ *
+ * The trigger is PROOF, not a heuristic: the caller fires this only when the body
+ * carries the ENGINE-WRITTEN `## Applied answers` record, which only
+ * `apply-persist.ts` writes and only after a human answered every open question.
+ * A hand-written note cannot accidentally acquire it, and the stamp is exactly
+ * what the apply rung WOULD have written had it known how.
+ *
+ * ONE commit touching ONE file, so the tree-less publish (`pushTreelessResult`)
+ * carries it to the arbiter like any other triage-rung marker write; once landed
+ * the note drops out of the triage pool and this path is never taken again.
+ */
+export function stampTriagedMarker(
+	options: StampTriagedMarkerOptions,
+): StampTriagedMarkerResult {
+	const {cwd, item, itemPath, value, reason, env} = options;
+	const note = options.note ?? (() => {});
+
+	if (gitSoft(['rev-parse', '--git-dir'], cwd, env).status !== 0) {
+		throw new TriagePersistError('not inside a git repository');
+	}
+
+	const abs = join(cwd, itemPath);
+	const before = readFileSync(abs, 'utf8');
+	const after = setFrontmatterMarker(before, 'triaged', value);
+	if (after === before) {
+		// Already marked (or a malformed fence `setFrontmatterMarker` refuses to
+		// rewrite) — nothing to commit; never produce an empty commit.
+		const message = `triage ${item}: already carries triaged:${value} — no stamp needed.`;
+		note(message);
+		return {message};
+	}
+	writeFileSync(abs, after);
+	const by = options.by || resolveBy(cwd, env);
+	gitHard(['add', '--', itemPath], cwd, env);
+	const subject = `advance: triage ${item} → settled (by ${by})`;
+	gitHard(
+		[
+			'commit',
+			'--quiet',
+			'-m',
+			subject,
+			'-m',
+			`triaged: ${value}\n\n${reason}`,
+		],
+		cwd,
+		env,
+	);
+	const commit = gitHard(['rev-parse', 'HEAD'], cwd, env).stdout.trim();
+	const message =
+		`triage ${item}: back-stamped triaged:${value} (the note was already ` +
+		'resolved-and-kept — it carries an engine-written applied-answers record) ' +
+		'so the triage rung stops re-asking its settled question.';
+	note(message);
+	return {commit, message};
+}
+
 // --- The conservative auto-disposition (US #17) ---------------------------
 
 export interface AutoDispositionOptions {
@@ -149,8 +248,10 @@ export interface AutoDispositionResult {
 	 * DELETION (`git rm` in a standalone commit, the reason in the message). A
 	 * `duplicate` is a redundant copy of `existing`; a `map` is already covered by
 	 * `existing` — either way the note carries no unique signal, so it leaves the
-	 * inbox by being gone. There is no resting `triaged:keep` state any more (task
-	 * `agentic-apply-retire-disposition-vocabulary`). NEVER an auto-delete of a
+	 * inbox by being gone. An AUTO disposition never RESTS a note (task
+	 * `agentic-apply-retire-disposition-vocabulary`); resting a KEPT note is the
+	 * human-answered `resolve` verdict's job on the apply rung (ADR
+	 * `resolve-settles-the-question-loop-not-the-note`). NEVER an auto-delete of a
 	 * NON-redundant signal.
 	 */
 	outcome: 'deleted';
@@ -167,9 +268,9 @@ export interface AutoDispositionResult {
  * ONE local commit, no question surfaced. BOTH no-question cases DISCHARGE the
  * redundant note BY DELETION (`git rm` in a STANDALONE commit, the mapped/
  * duplicated-of identity + reason in the commit message; git history = archive).
- * There is no resting `triaged:keep` state any more (task
- * `agentic-apply-retire-disposition-vocabulary` — a signal is still-open,
- * acted-on, or deleted):
+ * An AUTO disposition never RESTS a note (task
+ * `agentic-apply-retire-disposition-vocabulary`): its two cases carry no unique
+ * signal, so they are still-open, acted-on, or deleted — never kept:
  *
  *   - `duplicate` → the note is an EXACT duplicate of `existing` (already
  *     captured); the original carries the signal, so the copy is deleted; or

@@ -56,7 +56,7 @@ Compose with the `to-task` discipline if available — it produces exactly this 
 
 Apply the `work/` contract (`work/protocol/WORK-CONTRACT.md`), especially:
 
-- **Discharge by deletion.** A capture-bucket note leaves the inbox by **deletion** the moment it stops being a live signal (git history is the archive). There is no `resolved` status; a note annotated "resolved" and kept is a contradiction.
+- **Discharge by deletion.** A capture-bucket note leaves the inbox by **deletion** the moment it stops being a live signal (git history is the archive). There is no `resolved` status for a spent signal; a note kept only to narrate that it was dealt with is a contradiction. The one note that legitimately stays is one whose signal is STILL live after the answer (a standing map of a known gap, accepted residue recorded nowhere else): it rests `triaged: <disposition>` + `needsAnswers: false` with the answers harvested into its body, and the marker means its question-loop is settled, never that its signal is finished.
 - **Promoted notes discharge on SPAWN, not on landing.** A note promoted into a task/ADR is deletable AS SOON AS that artifact carries its signal — _verify self-containment first_ — NOT when the spawned work lands in `tasks/done/`. "Delete once the task lands" is the resolved-but-kept contradiction. If the spawned artifact is NOT self-contained, the bug is the artifact (fix it to carry the signal), not a reason to keep the note.
 - **Forward & live only.** Don't back-fill a task/observation to narrate already-done work. A surviving observation describes a _pending or currently-signalled_ concern.
 

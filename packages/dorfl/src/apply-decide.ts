@@ -40,7 +40,13 @@ import {
  * by the task `apply-decide-resolve-verdict-mint-nothing` so the decider can
  * honestly handle "the human answered, keep the note on record, mint nothing"
  * (previously it had no valid verdict for that case and looped on `ask`,
- * re-surfacing an already-answered question every tick). `adr` was DEFERRED at the
+ * re-surfacing an already-answered question every tick). Its MEANING was SHARPENED
+ * by ADR `resolve-settles-the-question-loop-not-the-note`: `resolve` settles the
+ * QUESTION-LOOP on a note that REMAINS a live signal (and the persist stamps
+ * `triaged:` so the triage rung stops re-asking it, closing a second re-ask loop
+ * the first fix left open); a note whose SIGNAL is finished is `dispose`, not
+ * `resolve` — a dead note kept and stamped "resolved" is exactly the
+ * backward-artifact-in-a-forward-bucket the work contract forbids. `adr` was DEFERRED at the
  * keystone launch (no
  * ADR-mint path existed yet) and is now WIRED by the follow-on task
  * `agentic-apply-mint-adr-route`, which added the {@link
@@ -201,15 +207,22 @@ export function buildApplyDecisionPrompt(input: ApplyDecisionInput): string {
 		`    \`reason:\` frontmatter); a SPEC is git-mv-ed to \`specs/dropped/\` (RETAINED).`,
 		`    A task can NEVER be hard-deleted by the apply rung \u2014 dispose is the`,
 		`    only path off the board.`,
-		`  - "resolve": the answer SETTLES this item and there is NOTHING to mint (no`,
-		`    task/spec/adr) \u2014 the correct move is to CLOSE the question-loop while`,
-		`    KEEPING the note on record (e.g. an evidence/watch-item observation whose`,
-		`    answer is "acknowledged, keep this on record, no artifact"). The answers are`,
-		`    harvested into the item body and the loop is cleared; the note is RETAINED`,
-		`    (this is the sibling of "dispose", which DROPS the observation-note or`,
-		`    moves a task/spec to its terminal \u2014 pick "resolve" when the observation`,
-		`    should SURVIVE in place, "dispose" when it should not). Emit`,
-		`    {"outcome":"resolve","resolveReason":"\u2026"}.`,
+		`  - "resolve": the answer SETTLES the QUESTION-LOOP and there is NOTHING to`,
+		`    mint (no task/spec/adr), AND the note is STILL A LIVE SIGNAL worth keeping`,
+		`    in the inbox \u2014 e.g. a standing map of a known gap, or accepted residue the`,
+		`    answer explicitly says to keep on record until it is acted on. The answers`,
+		`    are harvested into the item body, the loop is cleared, and the note is`,
+		`    RETAINED and STAMPED as triaged, so it is never re-asked this question.`,
+		`    Emit {"outcome":"resolve","resolveReason":"\u2026"}.`,
+		`    PICK BETWEEN "resolve" AND "dispose" ON LIVENESS, NOT ON POLITENESS: both`,
+		`    close the loop and mint nothing, and the ONLY question is whether the note`,
+		`    is still a live signal AFTER this answer. If the answer means the signal is`,
+		`    FINISHED (the thing was fixed, it was already covered elsewhere, it is`,
+		`    obsolete, or its whole content is now carried by a task/spec/ADR/commit),`,
+		`    that note stops being live \u2014 emit "dispose", NOT "resolve". "resolve" is`,
+		`    only correct when the note still carries a signal nothing else records.`,
+		`    Do NOT use "resolve" as a soft "dispose": a note kept only to show it was`,
+		`    handled is a backward artifact in a forward bucket.`,
 		`  - "ask": you need more from the human before acting. Emit`,
 		`    {"outcome":"ask","question":"\u2026"} \u2014 ask everything you still need as ONE`,
 		`    batch (never a drip); the engine appends it and re-pauses.`,

@@ -32,10 +32,13 @@ import type {ObservationTriage} from './config.js';
 import {
 	autoDispositionObservation,
 	promoteObservation,
+	stampTriagedMarker,
 	type AutoDispositionOptions,
 	type AutoDispositionResult,
 	type PromoteObservationOptions,
 	type PromoteObservationResult,
+	type StampTriagedMarkerOptions,
+	type StampTriagedMarkerResult,
 } from './triage-persist.js';
 import {mintAdr, type MintAdrOptions, type MintAdrResult} from './mint-adr.js';
 import {LIFECYCLE_CAS_CONTENTION} from './advancing-lock.js';
@@ -57,6 +60,8 @@ import {
 } from './surface-persist.js';
 import {
 	applyAnsweredQuestions,
+	hasAppliedAnswersRecord,
+	TRIAGED_RESOLVE,
 	type ApplyAnsweredQuestionsOptions,
 	type ApplyAnsweredQuestionsResult,
 } from './apply-persist.js';
@@ -324,6 +329,15 @@ export interface AdvanceContext {
 	 * commit). Tests inject a spy; production uses {@link autoDispositionObservation}.
 	 */
 	autoDisposition?: (options: AutoDispositionOptions) => AutoDispositionResult;
+	/**
+	 * Back-stamp the `triaged:` settled marker on a note that was ALREADY
+	 * resolved-and-kept before the apply rung learned to stamp it (the legacy arm of
+	 * the triage rung's settled guard). Tests inject a spy; production uses
+	 * {@link stampTriagedMarker}.
+	 */
+	stampTriaged?: (
+		options: StampTriagedMarkerOptions,
+	) => StampTriagedMarkerResult;
 	/**
 	 * Promote an answered observation: CAS-create a new backlog stub keyed on the
 	 * NEW item's identity, then record + resolve the observation. Tests inject a
@@ -910,16 +924,41 @@ async function triageRung(input: RungExecInput): Promise<RungExecResult> {
 	// note. (Replaces the old `detectObservationLimbo` special-case: there is no
 	// limbo any more — an UNtriaged observation always surfaces the deterministic
 	// question below; a SETTLED one is a calm no-op here.)
+	//
+	// SECOND ARM — the LEGACY back-fill (ADR
+	// `resolve-settles-the-question-loop-not-the-note`): a note the apply rung
+	// resolved-and-KEPT before it learned to stamp the marker carries the
+	// ENGINE-WRITTEN `## Applied answers` record but NO marker, which is the exact
+	// shape this rung would re-ask forever. That record is PROOF the engine already
+	// applied a human's answers to this note, so we stamp what the apply rung would
+	// have written and no-op. Self-healing and one-shot: the stamped note drops out
+	// of the pool, so this arm can never fire twice for the same note.
 	{
 		const itemRel = findItemPath(cwd, input.namespace, input.slug);
 		if (itemRel !== undefined) {
-			const fm = parseFrontmatter(readFileSync(join(cwd, itemRel), 'utf8'));
+			const body = readFileSync(join(cwd, itemRel), 'utf8');
+			const fm = parseFrontmatter(body);
 			if (fm.triaged !== undefined && fm.triaged !== '') {
 				return {
 					exitCode: 0,
 					outcome: 'no-op',
 					message: `triage ${item}: already triaged (triaged:${fm.triaged}) — nothing to do.`,
 				};
+			}
+			if (hasAppliedAnswersRecord(body)) {
+				const stamp = context.stampTriaged ?? stampTriagedMarker;
+				const result = stamp({
+					cwd,
+					item,
+					itemPath: itemRel,
+					value: TRIAGED_RESOLVE,
+					reason:
+						'Back-filled: the note carries an engine-written applied-answers ' +
+						'record, so its triage question-loop was already settled by a human ' +
+						'answer before the apply rung stamped the marker.',
+					note,
+				});
+				return {exitCode: 0, outcome: 'no-op', message: result.message};
 			}
 		}
 	}
@@ -951,9 +990,10 @@ async function triageRung(input: RungExecInput): Promise<RungExecResult> {
 		if (decision.auto === true) {
 			// A no-question case (duplicate / map) — auto-disposition WITHOUT a
 			// question. BOTH discharge the redundant note BY DELETION (a duplicate is a
-			// redundant copy; a map is already covered by the item it maps onto). There
-			// is no resting `triaged:keep` state any more. NEVER auto-deletes a
-			// NON-redundant signal; NEVER auto-promotes.
+			// redundant copy; a map is already covered by the item it maps onto), so an
+			// AUTO disposition never RESTS a note — resting a KEPT note is the
+			// human-answered `resolve` verdict's job on the apply rung. NEVER auto-deletes
+			// a NON-redundant signal; NEVER auto-promotes.
 			const dispose = context.autoDisposition ?? autoDispositionObservation;
 			const result = dispose({
 				cwd,
@@ -1654,6 +1694,14 @@ async function applyAgenticDecision(
 		// the sibling of `dispose`, which git-rm's it or moves it to a terminal). `resolveReason` is advisory
 		// context only; the durable disposition record is the harvested `## Applied
 		// answers` block the resolve-fully path writes (NOT a separate convention).
+		//
+		// Because the note is KEPT, that same commit also stamps `triaged: resolve` on
+		// it (ADR `resolve-settles-the-question-loop-not-the-note`): a kept note stays
+		// in the inbox the triage rung scans, and without the marker its two
+		// classifier signals (`needsAnswers:false`, no sidecar) are IDENTICAL to a note
+		// that was never triaged — so the next tick re-surfaced the same engine-built
+		// triage question forever. The stamp is done by the persist, not here, so no
+		// caller of the resolve-fully path can forget it.
 		const apply = context.applyPersist ?? applyAnsweredQuestions;
 		try {
 			const result = apply({cwd, item, itemPath, note});

@@ -94,13 +94,20 @@ export interface Frontmatter {
 	 */
 	needsAnswers: boolean | undefined;
 	/**
-	 * The triage SETTLED marker (US #30). A non-empty `triaged:` value (e.g.
-	 * `keep` / `duplicate`) means a human (or the conservative auto-disposition)
-	 * has SETTLED this observation, so it DROPS OUT of the triage candidate pool
-	 * and is never re-asked. `undefined` when omitted (an UNTRIAGED observation,
-	 * still in the pool). Carried so the lifecycle-pool enumeration
-	 * (`advance-autopick-lifecycle-pools`) can exclude settled observations from
-	 * the triage selection.
+	 * The triage SETTLED marker (US #30). A non-empty `triaged:` value means this
+	 * observation's triage QUESTION-LOOP has been settled by a human's answer, so it
+	 * DROPS OUT of the triage candidate pool and is never re-asked. `undefined` when
+	 * omitted (an UNTRIAGED observation, still in the pool). Carried so the
+	 * lifecycle-pool enumeration (`advance-autopick-lifecycle-pools`) can exclude
+	 * settled observations from the triage selection.
+	 *
+	 * The one WRITER today is the apply rung's `resolve` verdict, which stamps
+	 * `triaged: resolve` on a note it settles and KEEPS (ADR
+	 * `resolve-settles-the-question-loop-not-the-note`). It says the question-loop is
+	 * settled, NOT that the signal is finished — a finished signal has no resting
+	 * state at all (it is deleted), and an ANSWERED sidecar still dominates this
+	 * marker (ADR `answered-observation-sidecar-dominates-triaged-marker`), so a
+	 * genuinely new question about a settled note is still asked and answered.
 	 */
 	triaged: string | undefined;
 	/** Slugs this item is blocked by; `[]` when omitted or empty. */
@@ -241,9 +248,9 @@ export function setNeedsAnswersMarker(content: string, value: boolean): string {
 /**
  * Set (or replace) a top-level scalar `<key>: <value>` frontmatter marker on a
  * `work/` markdown document, returning the new content. The generalised form of
- * {@link setNeedsAnswersMarker} the advance APPLY rung uses to stamp a
- * `triaged: keep` marker (US #30) on an item a human answered "keep" — so a
- * settled observation drops out of the candidate pool and is never re-asked. If a
+ * {@link setNeedsAnswersMarker} the advance APPLY rung uses to stamp the
+ * `triaged: resolve` marker (US #30) on a note a human's answer settles but KEEPS
+ * — so a settled observation drops out of the candidate pool and is never re-asked. If a
  * `<key>:` line already exists it is REPLACED (idempotent); otherwise it is
  * appended as the last line inside the frontmatter fence.
  *
