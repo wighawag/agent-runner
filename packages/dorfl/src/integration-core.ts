@@ -28,6 +28,7 @@ import {
 	reviewRoundsExhaustedReason,
 } from './review-gate.js';
 import {type IntegrateResult, type ReviewProvider} from './integrator.js';
+import {extractDecisionsBlock} from './agent-stop.js';
 import {ledgerWrite} from './ledger-write.js';
 import {selectProvider} from './github.js';
 import type {IntegrationMode} from './config.js';
@@ -1102,6 +1103,20 @@ export async function performIntegration(
 			cwd,
 			env,
 		);
+	}
+
+	// 2b. TRANSCRIBE the agent's `## Decisions` block into the DONE RECORD (the
+	//     builder's rationale channel, WORK-CONTRACT "Where a BUILDER's RATIONALE
+	//     lives"). The builder does NO git and MUST NOT edit the task body, and the
+	//     done-move is ours, so "record your rationale in the done record" is an
+	//     instruction it CANNOT obey directly. It emits a `## Decisions` block on the
+	//     one surface it owns (its final report, reaching us as `input.body`), and we
+	//     append it here: AFTER the move (so we write the record at its DONE path) and
+	//     BEFORE the `git add -A` below (so it rides the SAME atomic completion commit,
+	//     not a second one). Skipped for a TASKING transition (`lifecycle`), which
+	//     lands a spec: no done record, and no building agent.
+	if (!lifecycle) {
+		transcribeDecisionsIntoDoneRecord({cwd, slug, output: input.body, note});
 	}
 
 	// 3. Commit: git add -A (the agent's uncommitted work + the move) into ONE
@@ -2529,6 +2544,68 @@ const CAPTURE_NOTE_DIRS = [
 	workFolderPrefix('observations'),
 	workFolderPrefix('findings'),
 ] as const;
+
+/**
+ * TRANSCRIBE the build agent's `## Decisions` block into the DONE RECORD: the
+ * runner half of the builder's rationale channel (WORK-CONTRACT.md, "Where a
+ * BUILDER's RATIONALE lives").
+ *
+ * The builder MUST surface a non-obvious in-scope decision for ratification, but
+ * every home the contract used to offer it was UNREACHABLE: it does no git, it must
+ * not edit the task body (`CLAIM-PROTOCOL.md`), and the done-move, the completion
+ * commit and the PR body are all the RUNNER's. So an acceptance criterion like
+ * "rationale recorded in the done record" was structurally unsatisfiable, and the
+ * rationale scattered into a JSDoc, a changeset, or an invented
+ * `work/notes/observations/decisions-<slug>.md` note (a BACKWARD artifact in a LIVE,
+ * FORWARD bucket, so it can never be discharged). Reviewers then re-raised the
+ * identical "no Decisions block in the done record" finding on task after task.
+ *
+ * The fix is structural, not exhortative: the builder emits the block on the ONE
+ * surface it owns (its final report, which reaches us as `input.body`), and the
+ * runner, already the owner of the done-move, appends it here. Properties that
+ * matter:
+ *
+ *   - **Same commit.** The caller invokes this AFTER the `git mv` (so the record is
+ *     written at its `tasks/done/` path) and BEFORE `git add -A` (so it rides the
+ *     ONE atomic completion commit, never a second, dangling one).
+ *   - **Verbatim.** The agent's prose is appended unaltered under a `## Decisions`
+ *     heading; we add structure, never interpretation.
+ *   - **Idempotent.** A record that ALREADY carries a `## Decisions` section is left
+ *     untouched, so a `requeue` continue, or a re-run over an already-done-moved
+ *     branch (`source: 'done'`), cannot append the same block twice.
+ *   - **Best-effort.** No block, no record on disk, or an unreadable/unwritable file
+ *     is a silent no-op: a rationale note must NEVER fail an otherwise-green
+ *     completion (the same stance as {@link reportScoopedNotes}).
+ */
+function transcribeDecisionsIntoDoneRecord(params: {
+	cwd: string;
+	slug: string;
+	output: string | undefined;
+	note: (message: string) => void;
+}): void {
+	const {cwd, slug, output, note} = params;
+	const decisions = extractDecisionsBlock(output);
+	if (decisions === undefined) {
+		return; // the common case: the agent recorded no in-scope decision.
+	}
+	const path = workItemPath(cwd, 'done', slug);
+	if (!existsSync(path)) {
+		return; // no done record to annotate (a lifecycle/degenerate shape).
+	}
+	try {
+		const body = readFileSync(path, 'utf8');
+		if (/^##\s+Decisions\s*$/m.test(body)) {
+			return; // already transcribed (a continue/re-run): never duplicate.
+		}
+		const separator = body.endsWith('\n') ? '\n' : '\n\n';
+		writeFileSync(path, `${body}${separator}## Decisions\n\n${decisions}\n`);
+		note(
+			`Recorded the agent's "## Decisions" block in ${workItemRel('done', `${slug}.md`)}.`,
+		);
+	} catch {
+		// Best-effort: never fail a green completion over a rationale note.
+	}
+}
 
 /**
  * SCOOP + REPORT the agent-authored CAPTURED NOTES this run's atomic commit is
