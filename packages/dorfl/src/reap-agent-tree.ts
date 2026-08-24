@@ -72,11 +72,27 @@ export interface ReapResult {
 	detail: string;
 }
 
-/** Sleep helper (injectable clock is not needed: callers inject `wait` in tests). */
+/**
+ * Sleep helper (injectable clock is not needed: callers inject `wait` in tests).
+ *
+ * **The timer is deliberately REFERENCED — do not `unref()` it.** This sleep is
+ * the ONLY pending handle the runner holds while it waits for a signalled group
+ * to die: by the time {@link reapProcessGroup} runs, the harness has already
+ * destroyed the child's stdio and `unref`'d the child handle, and a pending
+ * promise is not a handle. An `unref`'d timer here therefore left the event loop
+ * with NOTHING referenced, so node did the correct thing with an empty loop and
+ * EXITED 0 mid-reap — abandoning the suspended `await` and with it the whole
+ * deadline checkpoint (no WIP commit, no branch push, no lock release, no
+ * sentinel release), while reporting success (observation
+ * `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`).
+ *
+ * Referencing it cannot hang a runner: this loop is bounded by construction
+ * (`sigtermGraceMs + sigkillTimeoutMs`), which is the same property that lets
+ * the launch resolve-on-`exit` discipline stay safe.
+ */
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => {
-		const timer = setTimeout(resolve, ms);
-		timer.unref?.();
+		setTimeout(resolve, ms);
 	});
 }
 

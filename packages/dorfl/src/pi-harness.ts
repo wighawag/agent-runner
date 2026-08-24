@@ -1,5 +1,5 @@
 import {spawn, spawnSync} from 'node:child_process';
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, writeSync} from 'node:fs';
 import {
 	NullHarness,
 	pidAlive,
@@ -65,6 +65,97 @@ import type {HarnessAdapter} from './config.js';
 
 /** The default pi CLI binary name (resolved on `PATH`). */
 export const DEFAULT_PI_BIN = 'pi';
+
+/**
+ * **A runner MUST NOT exit while an async launch is unsettled** (observation
+ * `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`).
+ *
+ * An `await` is not a handle: node keeps a process alive for referenced HANDLES
+ * (timers, sockets, child processes), and a suspended promise is none of those.
+ * {@link PiHarness.launchAsync} deliberately drops every handle it owns the
+ * moment pi exits (it destroys the stdio pipes and `unref`s the child so a
+ * leaked grandchild's inherited FDs cannot pin the loop), and on the deadline
+ * path it then keeps the promise pending across the process-group reap. In the
+ * field that combination let the event loop go EMPTY mid-reap: node exited
+ * normally with code 0, the suspended pipeline (checkpoint save, branch push,
+ * lock release, writer-sentinel release, job-record update) simply never ran,
+ * and the run reported SUCCESS while leaving the item locked and 90 minutes of
+ * agent work uncommitted.
+ *
+ * So the launch holds an explicit REFERENCED keep-alive for exactly as long as
+ * it is in flight, and an exit guard turns any remaining way of exiting mid-
+ * launch into a LOUD, non-zero failure instead of a silent success. The two are
+ * deliberately independent: the keep-alive prevents the known mechanism, the
+ * guard refuses to let any future variant of it be mistaken for a clean run.
+ */
+let inFlightLaunches = 0;
+/** The referenced handle that keeps the loop alive while launches are in flight. */
+let inFlightKeepAlive: NodeJS.Timeout | undefined;
+let inFlightExitGuardInstalled = false;
+
+/**
+ * The keep-alive tick. Long, because it exists ONLY to be a referenced handle:
+ * it never does work, and it is cleared the moment the last launch settles.
+ */
+const KEEPALIVE_TICK_MS = 60_000;
+
+/** Report an exit that happened with a launch still in flight, LOUDLY. */
+function installInFlightExitGuard(): void {
+	if (inFlightExitGuardInstalled) {
+		return;
+	}
+	inFlightExitGuardInstalled = true;
+	process.on('exit', (code) => {
+		if (inFlightLaunches === 0) {
+			return;
+		}
+		// `writeSync` on fd 2, NOT console.error: stderr to a pipe is asynchronous,
+		// and an `exit` listener is the last synchronous moment there is, so a
+		// buffered write would be dropped exactly when it matters most.
+		writeSync(
+			2,
+			`>> INTERNAL ERROR: dorfl is exiting while ${inFlightLaunches} agent ` +
+				'launch(es) are still in flight, so the run STOPPED between the agent ' +
+				'and its outcome: nothing was committed, pushed, surfaced or released, ' +
+				'and any item lock is still held. This is a dorfl defect, not a task ' +
+				'failure. Recover with `dorfl requeue <slug>` (the work branch/worktree ' +
+				'is kept) and please report it.\n',
+		);
+		if (code === 0) {
+			// NEVER report this as success: a caller (CI leg, driving loop, `run`
+			// tick) that only checks the status must see a failure here.
+			process.exitCode = 1;
+		}
+	});
+}
+
+/** Mark one async launch as started (holds the loop open + arms the guard). */
+function launchStarted(): void {
+	inFlightLaunches += 1;
+	installInFlightExitGuard();
+	if (inFlightKeepAlive === undefined) {
+		// REFERENCED on purpose: this is the handle that keeps the runner alive
+		// across the window where it owns no other one.
+		inFlightKeepAlive = setInterval(() => {}, KEEPALIVE_TICK_MS);
+	}
+}
+
+/** Mark one async launch as settled (releases the keep-alive when the last one lands). */
+function launchSettled(): void {
+	inFlightLaunches = Math.max(0, inFlightLaunches - 1);
+	if (inFlightLaunches === 0 && inFlightKeepAlive !== undefined) {
+		clearInterval(inFlightKeepAlive);
+		inFlightKeepAlive = undefined;
+	}
+}
+
+/**
+ * How many async launches are currently unsettled. Exposed for the regression
+ * test that pins the keep-alive/guard invariant; not part of the harness seam.
+ */
+export function inFlightLaunchCount(): number {
+	return inFlightLaunches;
+}
 
 /**
  * The grace period between a deadline SIGTERM and the follow-up SIGKILL in
@@ -233,7 +324,11 @@ export class PiHarness implements Harness {
 			command: [this.piBin, ...args].join(' '),
 			session: sessionFile,
 		};
-		return new Promise<LaunchResult>((resolve, reject) => {
+		// IN FLIGHT from here until the promise settles: hold the loop open and arm
+		// the exit guard, so the runner can never quietly disappear between the
+		// agent and its outcome (see the keep-alive block above).
+		launchStarted();
+		const launch = new Promise<LaunchResult>((resolve, reject) => {
 			const child = spawn(this.piBin, args, {
 				// Same as `launch`: spawn in the repo/worktree dir so the session
 				// header `cwd` groups the dashboard correctly (invariant #3).
@@ -435,6 +530,11 @@ export class PiHarness implements Harness {
 				child.stdin?.write(input.prompt);
 			}
 			child.stdin?.end();
+		});
+		// Release the keep-alive on BOTH outcomes (resolve AND reject) — a failed
+		// spawn must not pin the loop open for the rest of the process's life.
+		return launch.finally(() => {
+			launchSettled();
 		});
 	}
 
