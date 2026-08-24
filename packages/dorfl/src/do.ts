@@ -17,7 +17,12 @@ import {
 	resolvePromptGuidanceForItem,
 	PromptError,
 } from './prompt.js';
-import {NullHarness, type AgentTreeReap, type Harness} from './harness.js';
+import {
+	NullHarness,
+	type AgentTreeReap,
+	type Harness,
+	type HarnessRecord,
+} from './harness.js';
 import {acquireWorktreeWriterLock} from './worktree-writer-lock.js';
 import {PiHarness} from './pi-harness.js';
 import {launchWithOptionalWatch} from './agent-launch.js';
@@ -33,7 +38,7 @@ import {
 	type IsolatedTree,
 } from './isolation.js';
 import {ensureMirror, encodeRepoKey, mirrorPath} from './repo-mirror.js';
-import {jobWorktreePath} from './workspace.js';
+import {jobWorktreePath, updateJobRecord} from './workspace.js';
 import {reapJob} from './gc.js';
 import {isGitHubArbiterUrl, GitHubProvider} from './github.js';
 import type {ReviewProvider} from './integrator.js';
@@ -1983,6 +1988,15 @@ async function runDoAgent(
 	output?: string;
 	timedOut?: boolean;
 	reap?: AgentTreeReap;
+	/**
+	 * The launch's real harness record (adapter + liveness anchor), when the run
+	 * went through a harness. The caller threads it into the job record so the
+	 * record says what ACTUALLY ran, not `createJob`'s placeholder
+	 * (`{adapter: 'null'}`) — the placeholder is what stranded a field
+	 * investigation into reading a healthy pi run as a null-harness misfire
+	 * (observation `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`).
+	 */
+	record?: HarnessRecord;
 }> {
 	if (options.dorfl) {
 		return options.dorfl({cwd, prompt, slug, env: options.env});
@@ -2032,6 +2046,7 @@ async function launchAgentUnderWriterLock(params: {
 	output?: string;
 	timedOut?: boolean;
 	reap?: AgentTreeReap;
+	record?: HarnessRecord;
 }> {
 	const {options, cwd, prompt, slug, harness} = params;
 	// Convert the dorfl-internal deadline (minutes) into a wall-clock epoch-ms so
@@ -2068,6 +2083,10 @@ async function launchAgentUnderWriterLock(params: {
 		detail: launched.detail,
 		output: launched.output,
 		timedOut: launched.timedOut,
+		// The launch's REAL record (adapter + pid/session anchor) — the caller
+		// finalises the job record with it (mirroring `run.ts`), so a `do` job's
+		// record stops reading `{adapter: 'null'}` forever.
+		record: launched.record,
 		// The harness's PROOF that a deadline-stopped agent's process tree is gone.
 		// Threaded to {@link routeDeadlineCheckpoint}, which refuses to release the
 		// item lock without it.
@@ -2610,6 +2629,12 @@ export async function performDoRemote(
 				throw err;
 			}
 			result = await runRemotePipeline(options, tree, slug, note, env);
+			// Finalise the job record to MATCH the terminal outcome (mirroring `run`'s
+			// tail): a retained worktree whose record still says `state: running`
+			// reads as a crashed job to `status`/`gc` FOREVER, when the run in fact
+			// reached a decision (observation
+			// `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`).
+			finaliseDoJobRecord(tree.dir, result);
 			return result;
 		} finally {
 			// 7. Teardown via the strategy handle. On a CLEAN completion: reap iff clean
@@ -2629,6 +2654,53 @@ export async function performDoRemote(
 	} finally {
 		// Remove the throwaway claim clone either way.
 		rmSync(claimDir, {recursive: true, force: true});
+	}
+}
+
+/**
+ * Bring a `do --remote`/`--isolated` job record in line with the terminal outcome
+ * the pipeline is returning — the SAME tail discipline `run` applies
+ * (`updateJobRecord(tree.dir, …)` on every routed outcome), which the `do` path
+ * never had (
+ * `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`): until now
+ * `createJob`'s initial `state: 'running'` record stood FOREVER on a retained
+ * worktree, so `status`/`gc` could not tell a decided-but-retained job from a
+ * runner that died mid-flight.
+ *
+ * The mapping is by outcome family, mirroring `run`'s tail:
+ *
+ *  - `completed`: state `done` (usually moot — the §4 teardown reaps the
+ *    worktree and its record immediately; kept for parity and for the retained
+ *    edge).
+ *  - `deadline-auto-continued`: deliberately UNTOUCHED. Nothing needs
+ *    attention — the checkpoint saved the WIP, pushed the branch, and released
+ *    the lock so the next claim continues the job. The record's `running` here
+ *    means "the job is not over", which is true.
+ *  - everything else that reached a terminal decision (needs-attention family,
+ *    the failure-cause axis, agent-stopped, refusals/usage errors): state
+ *    `needs-attention` with the pipeline's own message as the reason, so
+ *    `status` surfaces WHY without re-deriving it.
+ *
+ * Outcomes that never claimed the item (`lost`/`contended`) return before a
+ * worktree exists, so they never reach this helper. A pipeline that THREW
+ * likewise skips it — the failure is loud (the CLI crashes non-zero), and the
+ * retained record now carries the real harness anchor (finalised at launch),
+ * so `status` reads it as crashed-running-but-dead, which is honest.
+ */
+function finaliseDoJobRecord(dir: string, result: DoResult): void {
+	switch (result.outcome) {
+		case 'completed':
+			updateJobRecord(dir, {state: 'done'});
+			return;
+		case 'deadline-auto-continued':
+		case 'lost':
+		case 'contended':
+			return;
+		default:
+			updateJobRecord(dir, {
+				state: 'needs-attention',
+				reason: result.message,
+			});
 	}
 }
 
@@ -2882,6 +2954,7 @@ async function runRemotePipeline(
 		output?: string;
 		timedOut?: boolean;
 		reap?: AgentTreeReap;
+		record?: HarnessRecord;
 	};
 	try {
 		agent = await runDoAgent(options, cwd, prompt, slug);
@@ -2896,6 +2969,19 @@ async function runRemotePipeline(
 			env,
 			note,
 		});
+	}
+	// FINALISE the job record's harness block with the REAL launch record the
+	// agent ran under (mirroring `run.ts`'s `updateJobRecord(tree.dir,
+	// {harness: launched.record})`): `createJob` wrote the placeholder
+	// `{adapter: 'null'}`, and nothing on the `do` path ever overwrote it, so
+	// every `do` job's record read as adapter-null forever — on BOTH healthy and
+	// failed runs (observation
+	// `deadline-reap-lets-node-exit-0-before-the-checkpoint-runs`; a field
+	// investigation read it as "no agent was attached" and chased the wrong
+	// defect). The pid/session anchor is also what `status`/`gc` need to answer
+	// liveness for a do-path job AT ALL.
+	if (agent.record !== undefined) {
+		updateJobRecord(cwd, {harness: agent.record});
 	}
 	// Deadline checkpoint on the no-checkout `do --remote` path — same routing
 	// as the in-place path (see performDo).

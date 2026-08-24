@@ -103,7 +103,8 @@ Landed as `work/tasks/done/runner-must-not-exit-between-the-agent-and-its-outcom
 
 The regression test runs a BARE runner process, because this defect is invisible from inside vitest: the test runner's own handles keep the loop alive, which is exactly why the existing in-process deadline/reap suite passed throughout. On the pre-fix code it reproduces the field symptom byte for byte (preamble printed, nothing after the `await`, no `finally`, exit 0).
 
-What is STILL LIVE, and why this note is kept rather than deleted:
+Landed LATER THE SAME DAY as `work/tasks/done/do-job-record-finalises-with-real-harness-and-outcome.md`: the first residue below is now fixed — the `do` path finalises every job record with the REAL harness record at launch-settle and with the real terminal outcome before teardown, mirroring `run`'s discipline. A retained record now carries the pid/session anchor, so `status`/`gc` can answer liveness for a do-path job, and a retained record reads its actual outcome rather than a bare `running`.
 
-- The `do` path (in place and `--isolated`/`--remote`) never calls `updateJobRecord`, so `"state": "running"` and `harness: {"adapter": "null"}` are the initial and only values on every `do` job, healthy or not. Only `run` finalises the record with the real launch record. Anyone debugging a `do` job from `~/.dorfl/work/<work-id>.json` will read those fields as evidence, and they are not: that is precisely what happened here, and the wrong cause was written into the task's requeue handoff note.
+The one piece STILL LIVE, and why this note is kept rather than deleted:
+
 - The `?? new NullHarness()` sites (`do.ts`, `apply-decide.ts`, `intake.ts` x2) remain a silent default for library/embedding callers. Not reachable from the CLI (`doNeedsAgentCmd` refuses earlier), so it was not this defect, but a build path that silently attaches no agent is still the wrong default for a seam.
