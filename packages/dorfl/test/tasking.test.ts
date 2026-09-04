@@ -687,7 +687,20 @@ describe('performTask — lock lost / agent failed', () => {
 		expect(agentRan).toBe(false);
 	});
 
-	it('an agent failure is reported (agent-failed); the lock is NOT released', async () => {
+	// BEHAVIOUR CHANGE (observation
+	// `crashed-do-spec-strands-a-tasking-lock-no-verb-releases`): this test used to
+	// assert `released === false`, PINNING the very defect that stranded a tasking
+	// lock in the field. The old justification ("recoverable/re-run") did not hold:
+	// nothing released the lock afterwards, so the re-run it promised was precisely
+	// what became impossible — every retry lost the create-only CAS to a holder that
+	// no longer existed, and recovery required hand-deleting the ref.
+	//
+	// A crashed tasking agent publishes NOTHING (the work branch is local-only until
+	// the integrate band), so releasing its lock discards nothing and returns the
+	// spec to the taskable pool. The assertion is inverted deliberately; the
+	// end-to-end proof over real refs lives in
+	// `tasking-agent-failure-releases-lock.test.ts`.
+	it('an agent failure is reported (agent-failed) AND the lock is RELEASED', async () => {
 		const {repo} = seedRepoWithArbiter(scratch.root, []);
 		seedPrd(repo, 'it');
 		let released = false;
@@ -714,8 +727,12 @@ describe('performTask — lock lost / agent failed', () => {
 		expect(result.exitCode).toBe(1);
 		expect(result.outcome).toBe('agent-failed');
 		expect(result.message).toMatch(/boom/);
-		// The runner did NOT release the lock on a failed task (recoverable/re-run).
-		expect(released).toBe(false);
+		// The runner RELEASES the lock on a failed task, so the re-run is actually
+		// possible rather than merely asserted.
+		expect(released).toBe(true);
+		// The crash is still reported faithfully — the release must not launder an
+		// agent failure into a success.
+		expect(result.message).toMatch(/[Rr]eleased the tasking lock/);
 	});
 });
 

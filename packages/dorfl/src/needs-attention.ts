@@ -675,13 +675,53 @@ export async function returnToBacklog(
 		held = await readLocalItemLock(slug, cwd, env);
 	}
 	if (!held) {
+		// CROSS-NAMESPACE HINT (observation
+		// `crashed-do-spec-strands-a-tasking-lock-no-verb-releases`). `requeue` is a
+		// TASK-only verb, so a bare `<slug>` resolves to `task:<slug>` and finds no
+		// lock when what is ACTUALLY stranded is the SPEC lock a crashed `do
+		// spec:<slug>` left behind. The blunt "wrong slug, or already at rest?"
+		// refusal then actively MISLEADS: it asserts nothing is held while
+		// `refs/dorfl/lock/spec-<slug>` sits right there on the arbiter, sending the
+		// operator to look for a typo instead of at the lock they are holding.
+		//
+		// So before refusing, probe the SPEC namespace for the same slug and, on a
+		// hit, name the verb that DOES own that lock. We do NOT release it here:
+		// `requeue`'s contract is keep/continue/rebase/reset/reconcile of a WORK
+		// BRANCH, and a tasking run has no work branch to continue — releasing a
+		// spec lock from a task verb would fork a second release mechanism for the
+		// ref `release-lock` already owns. A pointer, not a second implementation.
+		//
+		// Best-effort and non-fatal: the probe is one extra ref read on a path that
+		// is already terminal, and any fault leaves the original refusal intact.
+		let specHint = '';
+		try {
+			const specHeld = await readItemLock({
+				item: `spec:${slug}`,
+				cwd,
+				arbiter,
+				env,
+			});
+			if (specHeld) {
+				specHint =
+					` NOTE: a SPEC lock IS held for this slug ` +
+					`(refs/dorfl/lock/spec-${slug}, ${specHeld.action}/${specHeld.state}` +
+					`${specHeld.holder ? `, holder: ${specHeld.holder}` : ''}` +
+					`${specHeld.since ? `, since: ${specHeld.since}` : ''}) — left by a ` +
+					`\`do spec:${slug}\` run. requeue does not act on specs; if that run ` +
+					`is DEAD, clear it with \`dorfl release-lock spec:${slug}\` (a crashed ` +
+					`tasking run publishes no work branch, so releasing discards nothing).`;
+			}
+		} catch {
+			// Best-effort hint only: fall through to the plain refusal.
+		}
 		return {
 			moved: false,
 			reasonNotMoved:
 				`'${slug}' has no held per-item lock on ${arbiter} — nothing to requeue ` +
 				'(wrong slug, or already at rest in backlog/done?). requeue recovers a ' +
 				'task whose lock is held stuck (needs-attention) or active (a killed ' +
-				'in-progress run).',
+				'in-progress run).' +
+				specHint,
 		};
 	}
 

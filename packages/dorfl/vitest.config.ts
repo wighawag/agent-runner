@@ -57,6 +57,15 @@ const RACE_SENSITIVE = [
 	// tasked); keep it out of file-parallel pressure for the same deterministic
 	// claim/main-CAS reasoning as tasking-lock.test.ts.
 	'test/tasking.test.ts',
+	// The crashed-tasking-agent lock-release regression tests (observation
+	// `crashed-do-spec-strands-a-tasking-lock-no-verb-releases`): drive `performTask`
+	// with a REAL lock seam against a --bare arbiter — acquiring + releasing
+	// `refs/dorfl/lock/spec-<slug>`, and on the success-retry case writing main /
+	// pushing the work branch through the integrate band. Same git-`file://`-CAS
+	// class as tasking.test.ts (and it showed the documented spawn-stdin EPIPE
+	// under file-parallel pressure while passing 9/9 in isolation); run it
+	// sequentially for the same deterministic claim/main-CAS reasoning.
+	'test/tasking-agent-failure-releases-lock.test.ts',
 	// The `do spec:<slug>` slice-output-through-integration keystone
 	// (`slice-output-through-integration`): routes the produced tasks + the spec
 	// lifecycle move through the shared `performIntegration` core, driving the lock

@@ -335,11 +335,39 @@ export async function acquireItemLock(
 			return {outcome: 'acquired', entry, ref, message: `locked ${entry}`};
 		}
 		// Rejected: the ref already exists (held by someone for the SAME item).
+		//
+		// NAME THE RECOVERY VERB (observation
+		// `crashed-do-spec-strands-a-tasking-lock-no-verb-releases`). This refusal
+		// used to be a DEAD END: `'<entry>' is already locked (held by another). Back
+		// off.` is right for LIVE contention but says nothing to the operator whose
+		// holder is a process that already died, who reads it as "the system is
+		// working" and has no thread to pull. In the field that cost a full
+		// escalation-ladder search (`requeue`, then `gc`, then hand-rolled `git push
+		// origin :refs/dorfl/lock/<entry>`) for a verb, `release-lock`, that existed
+		// the whole time.
+		//
+		// The wording keeps BACK OFF as the default (contention between two live
+		// runners is the COMMON case, and a runner must never be nudged into
+		// stealing a healthy peer's lock) and offers the release strictly under the
+		// operator-asserted condition "if the holder is dead" — the same trust model
+		// `release-lock`/`requeue` already use (a HUMAN asserts liveness; the tool
+		// never guesses, since the lock has no heartbeat).
+		//
+		// `itemFromLockEntry` is PURE (no extra round-trip on this hot, frequently
+		// contended path) and yields a copy-pasteable command; for a pre-cutover
+		// entry with no current item-form it falls back to the `--entry` escape
+		// hatch, matching what `gc --ledger` prints for the same entry.
+		const clear = hasCurrentItemForm(entry)
+			? `dorfl release-lock ${itemFromLockEntry(entry)}`
+			: `dorfl release-lock --entry ${entry}`;
 		return {
 			outcome: 'lost',
 			entry,
 			ref,
-			message: `'${entry}' is already locked (held by another). Back off.`,
+			message:
+				`'${entry}' is already locked (held by another). Back off. ` +
+				`If the holder is DEAD (a crashed run that never released), inspect ` +
+				`it with \`dorfl gc --ledger\` and clear it with \`${clear}\`.`,
 		};
 	} catch (err) {
 		return {

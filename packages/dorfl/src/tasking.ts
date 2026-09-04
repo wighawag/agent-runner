@@ -536,10 +536,59 @@ export async function performTask(
 	}
 	if (!agent.ok) {
 		const detail = agent.detail ?? `the agent failed to task '${slug}'.`;
-		const message = `Agent failed tasking '${slug}' (${detail}).`;
+		let message = `Agent failed tasking '${slug}' (${detail}).`;
+		// RELEASE THE LOCK THE FAILED RUN TOOK (observation
+		// `crashed-do-spec-strands-a-tasking-lock-no-verb-releases`).
+		//
+		// The pre-fix behaviour left the lock HELD on the arbiter, justified by a
+		// comment claiming "surfacing it is the review/edit loop's job". That is
+		// UNREACHABLE from here: the review/edit loop runs at step 3.5, strictly
+		// AFTER this early return, so an agent that dies at step 3 is surfaced by
+		// NOBODY. The lock outlived every process that knew about it and each retry
+		// of `do spec:<slug>` lost the create-only CAS against a holder that no
+		// longer existed (`'spec-<slug>' is already locked (held by another)`).
+		// Field trigger: three consecutive model-API faults (`Connection error.`,
+		// `overloaded_error`, `api_error`).
+		//
+		// WHY A PLAIN RELEASE AND NOT A `stuck` SURFACE. The sibling failure just
+		// below (`ReviewParseError`) routes through `surfaceTaskingBlock`, which
+		// marks the spec `needsAnswers:true` + writes a question sidecar. That is
+		// correct THERE (a review verdict is a JUDGEMENT a human must resolve) and
+		// wrong HERE: an agent/transport crash carries no judgement to record, and
+		// surfacing it would take the spec OUT of the taskable pool behind a
+		// contentless question — turning a retryable blip into mandatory human
+		// paperwork. A crashed agent is RETRYABLE, so the recovery is to return the
+		// spec to the pool and let `do spec:<slug>` simply be re-run.
+		//
+		// WHY THIS DISCARDS NOTHING. The tasking work branch is created by
+		// `switchToWorkBranch` with a LOCAL `git switch -C` and is never pushed
+		// before the integrate band; the durable `specs/ready → specs/tasked` move
+		// also happens only at integrate. A run that died at step 3 therefore
+		// published NOTHING to the arbiter, so releasing its lock cannot lose work.
+		// The release is deliberately no more cautious than that risk warrants.
+		//
+		// A release FAULT is reported but never masks the agent failure: the agent
+		// outcome is the terminal one, and `release-lock spec:<slug>` remains the
+		// human backstop for the case where this process is itself killed.
+		if (useLock) {
+			const released = await lock.release({
+				slug,
+				cwd,
+				arbiter,
+				lockedBlob,
+				env,
+				note,
+			});
+			message =
+				released.exitCode === 0
+					? `${message} Released the tasking lock for '${slug}' — the spec is ` +
+						'back in the taskable pool, so re-run `dorfl do spec:' +
+						`${slug}\` to retry (nothing was published, so nothing was lost).`
+					: `${message} WARNING: could not release the tasking lock for ` +
+						`'${slug}' (${released.message}). Clear it with \`dorfl ` +
+						`release-lock spec:${slug}\` before retrying.`;
+		}
 		note(message);
-		// The lock stays held (the runner did not release it): a stuck tasking is
-		// recoverable / re-runnable. Surfacing it is the review/edit loop's job.
 		return {exitCode: 1, outcome: 'agent-failed', slug, message};
 	}
 
