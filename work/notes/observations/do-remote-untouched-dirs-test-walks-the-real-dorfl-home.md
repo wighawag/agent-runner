@@ -26,3 +26,18 @@ It is also a false signal at the worst moment: the gate reds while investigating
 - Or keep the walk but give the test a timeout proportional to what it is asked to do, and accept that the gate's cost varies with the developer's home.
 
 The open question is which of those the invariant actually wants, since the current test is quietly asserting two different things (nothing leaked, and the leak check is cheap).
+
+## Later datum (2026-09-03): the suite is FEEDING the directory it then walks
+
+Hit again while fixing an unrelated tasking-lock defect, and the re-measurement changes the shape of the problem. The walk cost is not merely a function of the developer's *usage* history; **the test suite grows the walked directory on every run**, so the gate degrades by running it.
+
+Measured on this machine: `~/.dorfl` = 2.5 GB / 110,346 files, of which `~/.dorfl/repos/tmp` holds **600 leftover `pre-backlog-step-a-*` scratch dirs** (83 MB). Those are left by a DIFFERENT test writing its scratch into the real state root instead of a `makeScratch` temp dir. So a sibling test is committing the very shared-write violation this test exists to catch, and it is invisible to the assertion because the leak happens outside the before/after window. `~/.dorfl/webkit-spike-build` (1.6 GB) is another unrelated non-test resident inflating the same walk.
+
+Two consequences the candidate directions above do not cover:
+
+- The failure is **load- and history-dependent, not deterministic**: this test passed in the full suite earlier the same day and failed after four more full-suite runs had added scratch, then passed again in isolation with the identical tree. Anyone bisecting a red gate will mis-attribute it to whatever change is in the tree, exactly as happened here (it cost a stash-and-rerun on a pristine tree to clear the fix under review).
+- Whichever direction is chosen for THIS test, `pre-backlog-step-a-*` should be routed to scratch regardless. That is an independent leak, and it is the one actually accumulating.
+
+Suggested cheap first move, independent of the open question: fix the leaking test to use `makeScratch`, and have the suite fail loudly if any test writes under `~/.dorfl` (a guard is more honest than a snapshot diff, and is O(1) rather than O(home)).
+
+Housekeeping note for whoever picks this up: the 600 leftover dirs are still on this machine and were deliberately NOT deleted (they are in the developer's real state root, not the agent's to remove unasked).
