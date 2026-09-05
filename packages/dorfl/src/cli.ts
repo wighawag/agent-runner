@@ -167,6 +167,7 @@ interface ScanFlags {
 	autoBuild?: boolean;
 	json?: boolean;
 	here?: boolean;
+	reconcileLocks?: boolean;
 	arbiterRemote?: string;
 	arbiter?: string;
 }
@@ -1029,6 +1030,7 @@ interface StatusFlags {
 	arbiter?: string;
 	noArbiter?: boolean;
 	here?: boolean;
+	reconcileLocks?: boolean;
 	json?: boolean;
 }
 
@@ -1385,6 +1387,10 @@ export function buildProgram(): Command {
 			'--here',
 			'report ONLY the current repo (the cwd working tree, fetch-first): skip the cross-repo registry loop entirely. The fast, focused path — no N-mirror fetches.',
 		)
+		.option(
+			'--reconcile-locks',
+			'WRITE: release the per-item locks whose item is already at rest in a terminal folder on the arbiter’s main (e.g. a merged propose PR left its lock behind). Without this flag `scan` is strictly read-only. Not normally needed, the claim path releases them automatically on every unit of work. An item that is NOT terminal on main (a live build, an open PR, a stuck item) is NEVER released, with or without the flag.',
+		)
 		.option('--json', 'output the raw report as JSON')
 		.action(async (flags: ScanFlags, command: Commander) => {
 			const fileConfig = loadConfig(flags.config);
@@ -1403,6 +1409,7 @@ export function buildProgram(): Command {
 					override,
 					arbiterRemote: flags.arbiterRemote,
 					lockArbiterRemote: flags.arbiter ?? 'origin',
+					reconcileLocks: flags.reconcileLocks === true,
 					warn,
 				});
 			// `--here`: report ONLY the cwd — skip the registry loop ENTIRELY (the fast,
@@ -1425,7 +1432,11 @@ export function buildProgram(): Command {
 				}
 				return;
 			}
-			const report = await scan(config, {warn, override});
+			const report = await scan(config, {
+				warn,
+				override,
+				reconcileLocks: flags.reconcileLocks === true,
+			});
 			// The cwd-local section: resolve it ONLY when a participating cwd is NOT
 			// already covered by a registered mirror. A FETCH-FREE pre-check
 			// (`cwdSectionDisposition`) decides this with zero network I/O; an
@@ -3908,6 +3919,10 @@ export function buildProgram(): Command {
 			'--here',
 			'report ONLY the current repo (the cwd working tree, fetch-first): skip the jobs, registry-mirror, and arbiter sections entirely. "This repo, nothing else" — the fast, focused path.',
 		)
+		.option(
+			'--reconcile-locks',
+			'WRITE: release the per-item locks reported as "Completed, lock not yet released" (item already at rest in a terminal folder on the arbiter’s main, e.g. a merged propose PR). Without this flag `status` is strictly read-only and only REPORTS them. Not normally needed, the claim path releases them automatically on every unit of work; this is the manual “drain them now” lever. An item that is NOT terminal on main (a live build, an open PR, a stuck item) is NEVER released, with or without the flag.',
+		)
 		.option('--json', 'output the raw report as JSON')
 		.action(async (flags: StatusFlags) => {
 			const config = resolveGlobalConfig(loadConfig(flags.config), {});
@@ -3923,6 +3938,7 @@ export function buildProgram(): Command {
 					override,
 					arbiterRemote: flags.arbiterRemote ?? DEFAULT_ARBITER_REMOTE,
 					lockArbiterRemote: flags.arbiter ?? 'origin',
+					reconcileLocks: flags.reconcileLocks === true,
 					warn,
 				});
 			// `--here`: report ONLY the cwd — skip the jobs, registry-mirror, and arbiter
@@ -3976,6 +3992,7 @@ export function buildProgram(): Command {
 				mirrorPaths,
 				arbiter,
 				cwd: cwdSection,
+				reconcileLocks: flags.reconcileLocks === true,
 				warn,
 			});
 			if (flags.json) {

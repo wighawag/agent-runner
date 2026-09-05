@@ -8,7 +8,14 @@ import {
 	heldTaskSlugsStrict,
 	heldSpecSlugsStrict,
 	listItemLockEntries,
+	classifyTerminalItemLocks,
+	reconcileTerminalItemLocks,
+	type LockEntry,
 } from './item-lock.js';
+import {
+	classifyTerminalQuestionResidue,
+	reconcileTerminalQuestionResidue,
+} from './needs-attention.js';
 import type {Config} from './config.js';
 import type {ConfigOverrideMap} from './config-override.js';
 
@@ -105,6 +112,36 @@ export interface CwdSection {
 	registeredMirrorPath?: string;
 	/** The cwd repo's arbiter + divergence (fetch-first). Absent when no arbiter. */
 	arbiter?: CwdArbiter;
+	/**
+	 * Lock `<entry>` names whose item is already at REST in a terminal folder on
+	 * `<arbiter>/main`, finished work (typically a merged propose PR) whose lock
+	 * has not been released yet. These are STALE, not in flight, and are reported
+	 * separately from {@link RepoReport.lockHeld} so completed work never reads as
+	 * in-progress. Purely a CLASSIFICATION: `status` releases nothing (it is
+	 * read-only). They are released automatically by the next claim, or on demand
+	 * via `--reconcile-locks` / `dorfl gc --ledger --reap-stale-locks`.
+	 */
+	staleLocks?: string[];
+	/**
+	 * Lock `<entry>` names this call actually RELEASED. Populated ONLY under the
+	 * explicit `reconcileLocks` opt-in (`status --reconcile-locks`), which is the
+	 * one way this otherwise read-only resolver writes to the arbiter. Empty/absent
+	 * ⇒ nothing was written.
+	 */
+	reconciledLocks?: string[];
+	/**
+	 * Items resting in a TERMINAL folder on `main` that still carry question state
+	 * (a stale bounce sidecar, and often a stranded `needsAnswers:true` gate over
+	 * shipped work). Reported so the residue is visible; `status` clears nothing.
+	 * These drain on the next claim.
+	 */
+	staleQuestions?: string[];
+	/**
+	 * Terminal items whose sidecar carries a human's ANSWER that was never applied.
+	 * Deliberately NEVER auto-drained (the answer is prose the tool did not
+	 * author), so it is surfaced for a human instead.
+	 */
+	unappliedAnswers?: string[];
 }
 
 /** True iff the working repo has a git remote with name `remote`. The held-lock
@@ -204,6 +241,16 @@ export interface ResolveCwdSectionOptions {
 	 * arbiter even when the divergence remote is absent. Default `origin`.
 	 */
 	lockArbiterRemote?: string;
+	/**
+	 * OPT-IN WRITE (`status --reconcile-locks`). `false`/omitted (the DEFAULT)
+	 * keeps this resolver strictly READ-ONLY: stale locks are classified and
+	 * REPORTED via {@link CwdSection.staleLocks}, and nothing on the arbiter is
+	 * touched. `true` additionally RELEASES the locks whose item is terminal on
+	 * `<arbiter>/main`, reporting them via {@link CwdSection.reconciledLocks}.
+	 * Not needed for routine convergence, the claim path already sweeps on every
+	 * unit of work; this is the manual "drain them now" lever.
+	 */
+	reconcileLocks?: boolean;
 	/** Sink for the fetch-first fall-back warning (warn + last-known, never error). */
 	warn?: (message: string) => void;
 	env?: NodeJS.ProcessEnv;
@@ -261,6 +308,96 @@ export async function resolveCwdSection(
 	//    nothing to fail against — it keeps the empty set.
 	const lockRemote = options.lockArbiterRemote ?? 'origin';
 	const hasLockRemote = remoteExists(cwd, lockRemote, env);
+
+	// 2a. CLASSIFY the held locks against `main` (fix for the propose-path lock
+	//     leak; observation
+	//     `every-completed-task-leaves-its-lock-ref-reporting-in-progress`).
+	//     `complete --propose` deliberately keeps the lock HELD across the open PR
+	//     and promises it is "released when the PR merges (reconciled against
+	//     main)", but NO dorfl process runs when a human clicks merge on GitHub,
+	//     and there is no daemon, so that release could never fire. Every completed
+	//     propose item therefore kept its lock ref and was reported in-progress for
+	//     ever.
+	//
+	//     `status` is READ-ONLY and stays that way: by DEFAULT this only
+	//     CLASSIFIES, splitting the held locks into genuinely in-flight ones and
+	//     ones whose item has come to REST in a terminal folder on
+	//     `<arbiter>/main`. That alone fixes the MIS-REPORTING half of the bug
+	//     finished work stops reading as in-progress, without this command
+	//     mutating the arbiter. The REF is drained by the paths that already write
+	//     on every unit of work (the claim path), or on demand here via the
+	//     explicit `reconcileLocks` opt-in below.
+	//
+	//     The terminal test is the item's POSITION ON MAIN, never a branch or a
+	//     PR, so an item on an OPEN PR (body still in the pool on `main`) stays
+	//     in-flight, as does a genuinely stuck one. Ordered BEFORE the held-slug
+	//     reads below so, under the opt-in, the subtraction and the in-flight
+	//     surface both see the reconciled truth in the SAME run.
+	//
+	//     Best-effort by construction: neither call throws, and every uncertainty
+	//     resolves to KEEP, so an offline or push-denied checkout degrades to the
+	//     previous behaviour.
+	//
+	//     The cwd is a WORKING CLONE, so the arbiter's main is the remote-tracking
+	//     ref `<lockRemote>/main`, which is the default. (A bare hub mirror would
+	//     need `mainRef: 'main'`; see the mirror callers in `status`/`scan`.)
+	let staleLocks: string[] = [];
+	let reconciledLocks: string[] = [];
+	// The in-flight entries, taken straight from the classification so the surface
+	// below needs no second `ls-remote` + fetch. `undefined` = not read at all.
+	let inFlightLocks: LockEntry[] | undefined;
+	if (hasLockRemote) {
+		if (options.reconcileLocks === true) {
+			// The ONLY write this resolver performs, and only when explicitly asked.
+			const swept = await reconcileTerminalItemLocks(cwd, lockRemote, env);
+			reconciledLocks = swept.released;
+			inFlightLocks = swept.stillHeld;
+			// Under an EXPLICIT drain request a refusal must be reported: the operator
+			// asked for these to go away, so silence would be a lie. (On the claim
+			// path the same errors are ignored on purpose: there the sweep is
+			// opportunistic hygiene, not something the operator asked for.)
+			for (const e of swept.errors) {
+				options.warn?.(`could not release lock '${e.entry}': ${e.message}`);
+			}
+		} else {
+			const classified = await classifyTerminalItemLocks(cwd, lockRemote, env);
+			staleLocks = classified.terminal.map((l) => l.entry);
+			inFlightLocks = classified.inFlight;
+		}
+	}
+
+	// 2b. The OTHER half of the same terminal residue: a bounced-then-rebuilt item
+	//     whose sidecar + `needsAnswers` flag were never cleared (observation
+	//     `a-rebuilt-task-leaves-its-bounce-question-asking-to-cancel-a-merged-task`).
+	//     READ-ONLY here, exactly like the lock half: `status` reports it and the
+	//     claim path drains it. Best-effort; a fault yields an empty report.
+	let staleQuestions: string[] = [];
+	let unappliedAnswers: string[] = [];
+	if (hasLockRemote && options.reconcileLocks !== true) {
+		const residue = await classifyTerminalQuestionResidue({
+			cwd,
+			arbiter: lockRemote,
+			mainRef: `${lockRemote}/main`,
+			env,
+		});
+		staleQuestions = residue.drainable.map((r) => r.item);
+		unappliedAnswers = residue.answeredHeld.map((r) => r.item);
+	} else if (hasLockRemote) {
+		// Under the explicit opt-in the question residue is DRAINED alongside the
+		// locks, through the one shared pass.
+		const drained = await reconcileTerminalQuestionResidue({
+			cwd,
+			arbiter: lockRemote,
+			mainRef: `${lockRemote}/main`,
+			env,
+			note: options.warn,
+		});
+		unappliedAnswers = drained.answeredHeld;
+		for (const e of drained.errors) {
+			options.warn?.(`could not drain questions for '${e.item}': ${e.message}`);
+		}
+	}
+
 	const heldSlugs = hasLockRemote
 		? await heldTaskSlugsStrict(cwd, lockRemote, env)
 		: new Set<string>();
@@ -307,10 +444,16 @@ export async function resolveCwdSection(
 	//     different fault models (selection fails closed; the surface degrades).
 	//     Read from the SAME coordination remote the subtraction used. A repo with no
 	//     coordination remote has no lock refs to read — empty surface.
-	if (repo !== undefined && hasLockRemote) {
-		const lockHeld = await listItemLockEntries(cwd, lockRemote, env);
-		if (lockHeld.length > 0) {
-			repo.lockHeld = lockHeld;
+	if (repo !== undefined && inFlightLocks !== undefined) {
+		// Taken STRAIGHT from the classification in 2a, so the stale ones are already
+		// excluded. This is the reporting half of the propose-lock-leak fix: a lock
+		// whose item is already at REST on `main` is finished work, NOT an in-flight
+		// hold, so it must not appear under "In progress" (the symptom being fixed:
+		// completed tasks reported in-progress for ever). It is surfaced under
+		// `staleLocks` instead. Reusing that result also avoids a second `ls-remote` +
+		// fetch and the TOCTOU window between two separate reads.
+		if (inFlightLocks.length > 0) {
+			repo.lockHeld = inFlightLocks;
 		}
 	}
 
@@ -326,6 +469,10 @@ export async function resolveCwdSection(
 		path: cwd,
 		participating: true,
 		repo,
+		staleLocks,
+		reconciledLocks,
+		staleQuestions,
+		unappliedAnswers,
 		totalItems: localReport.totalItems,
 		totalEligible: localReport.totalEligible,
 		alsoRegistered,

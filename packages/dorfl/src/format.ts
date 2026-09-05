@@ -199,6 +199,78 @@ export function formatCwdSection(section: CwdSection): string[] {
 			lines.push(...formatLockEntryLines(entry, '      '));
 		}
 	}
+
+	// STALE locks, finished work whose lock has not been released yet (fix for the
+	// propose-path lock leak). `complete --propose` keeps the lock held and defers
+	// its release to the PR merge, an event dorfl is never present for, so these
+	// accumulate. They are shown as their OWN block and NOT under "In progress":
+	// reporting completed work as in-progress for ever was the symptom. `status` is
+	// read-only, so it names the state and how it clears rather than clearing it.
+	const stale = section.staleLocks ?? [];
+	if (stale.length > 0) {
+		lines.push('');
+		lines.push(
+			`    Completed, lock not yet released (${stale.length}; item is at rest ` +
+				'on main, so this is NOT in flight):',
+		);
+		for (const entry of stale) {
+			lines.push(`      ${entry}`);
+		}
+		lines.push(
+			'      These clear automatically on the next claim. To drain them now: ' +
+				'`dorfl status --reconcile-locks`.',
+		);
+	}
+
+	// STRANDED QUESTION STATE on terminal items: a bounce wrote a sidecar +
+	// `needsAnswers:true` atomically, the human re-dispatched instead of answering,
+	// the rebuild succeeded, and neither half was ever cleared. The flag is the
+	// harmful part: it is a gate left armed over shipped work, which is why this is
+	// surfaced rather than left to be discovered in the questions folder.
+	const staleQuestions = section.staleQuestions ?? [];
+	if (staleQuestions.length > 0) {
+		lines.push('');
+		lines.push(
+			`    Completed, question state not yet cleared (${staleQuestions.length}; ` +
+				'stale bounce sidecar and/or a needsAnswers gate on a finished item):',
+		);
+		for (const item of staleQuestions) {
+			lines.push(`      ${item}`);
+		}
+		lines.push(
+			'      These clear automatically on the next claim. To drain them now: ' +
+				'`dorfl status --reconcile-locks`.',
+		);
+	}
+
+	// A human's ANSWER that nothing ever applied. Never auto-drained, because the
+	// prose is data the tool did not author; it needs a human, so it is named.
+	const unapplied = section.unappliedAnswers ?? [];
+	if (unapplied.length > 0) {
+		lines.push('');
+		lines.push(
+			`    Answered but never applied (${unapplied.length}; the sidecar carries ` +
+				'your answer and the item is already finished, kept, never auto-deleted):',
+		);
+		for (const item of unapplied) {
+			lines.push(`      ${item}`);
+		}
+	}
+
+	// Locks this run actually RELEASED (only under the explicit
+	// `--reconcile-locks` opt-in, the one way `status` writes). Always reported,
+	// never silent.
+	const reconciled = section.reconciledLocks ?? [];
+	if (reconciled.length > 0) {
+		lines.push('');
+		lines.push(
+			`    Released ${reconciled.length} completed lock(s) (item is terminal on ` +
+				'main, the propose PR merged out-of-band):',
+		);
+		for (const entry of reconciled) {
+			lines.push(`      ${entry}`);
+		}
+	}
 	lines.push('');
 	lines.push(
 		`  Local total: ${total} ${pluralItems(total)} ` +

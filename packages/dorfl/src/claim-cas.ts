@@ -1,5 +1,6 @@
 import {runAsync, type RunResult} from './git.js';
 import {acquireItemLock, releaseItemLock, heldTaskSlugs} from './item-lock.js';
+import {reconcileTerminalState} from './reconcile-terminal.js';
 import {extractPromptSection} from './prompt.js';
 import {resolveReadiness} from './readiness.js';
 import {workBranchRef} from './slug-namespace.js';
@@ -385,6 +386,45 @@ async function runClaim(
 			await assertBodyWellFormed(bodyRel);
 		}
 	}
+
+	// LAZY RECONCILIATION of TERMINAL-STATE RESIDUE: the stale per-item lock a
+	// propose PR leaves behind (observation
+	// `every-completed-task-leaves-its-lock-ref-reporting-in-progress`) AND the
+	// stranded sidecar + `needsAnswers` flag a bounced-then-rebuilt item leaves
+	// behind (observation
+	// `a-rebuilt-task-leaves-its-bounce-question-asking-to-cancel-a-merged-task`).
+	// ONE pass, because they are the SAME defect wearing two hats: both are cleared
+	// by a step that only runs on a path the item did not take, both become moot at
+	// exactly the same moment (the done-move landing on `main`), and both are
+	// otherwise detectable only from a loop the manual path never enters.
+	//
+	// `complete --propose` deliberately KEEPS its per-item lock held across the open
+	// PR and promises "It is released when the PR merges (reconciled against main)".
+	// That release could never fire: no dorfl process runs when a human clicks merge
+	// on GitHub, there is no merge hook, and there is no daemon, so every completed
+	// propose item leaked its lock ref permanently.
+	//
+	// THIS is where the release belongs, and why it is here rather than on `status`:
+	// the merge EVENT is unobservable, but its CONSEQUENCE on `main` is durable, so
+	// any later sweep converges just as well as a timely one. `claim` is the natural
+	// host, it ALREADY writes to the arbiter (it is about to acquire a lock), it
+	// ALREADY fetched `main` just above, and it runs on EVERY unit of work, so the
+	// leaked set drains continuously without a human ever being asked to run a
+	// clean-up verb. Keeping the release on a write path is what makes the fix real:
+	// `gc --ledger` had been reporting these very locks and printing the
+	// `release-lock` command all along, and that offer is precisely what nobody was
+	// routed to. The read-only surfaces (`status`, `scan`) therefore only CLASSIFY.
+	//
+	// It acts EXACTLY on items that have come to REST in a terminal folder on
+	// `<arbiter>/main`; an item on an OPEN PR still shows its body in the pool and
+	// keeps both its lock and its question state, as does a genuinely stuck one.
+	// Clearing a live `needsAnswers` would be as bad as releasing a live lock: it
+	// would disarm a gate and hand gated work to agents. Best-effort and never throws:
+	// any fault leaves every lock HELD (the safe direction) and never fails the
+	// claim, which is unrelated work, this sweep is opportunistic hygiene, not a
+	// precondition. It also cannot affect THIS claim's outcome: an item terminal on
+	// `main` is not in the claimable pool anyway.
+	await reconcileTerminalState({cwd, arbiter, env});
 
 	// Acquire the lock FIRST. A lock `lost` (someone already holds this SAME item's
 	// lock) makes claim lose DEFINITIVELY — exit 2, NO retry budget (a per-item ref

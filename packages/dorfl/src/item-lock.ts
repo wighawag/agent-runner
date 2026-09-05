@@ -1378,6 +1378,309 @@ export async function classifyItemLockAgainstMain(
 	}
 }
 
+/**
+ * The READ-ONLY classification of every held per-item lock against the arbiter's
+ * `main`, partitioned by whether the lock's item has come to REST. It performs
+ * NO writes: it is what the read-only surfaces (`status`, `scan`) use to tell a
+ * genuinely in-flight hold apart from one whose work is already finished and
+ * merged. {@link reconcileTerminalItemLocks} is the WRITE twin that acts on the
+ * same classification, so the report and the release can never disagree about
+ * WHAT a lock is; only whether they act on it.
+ */
+/** Shared options for the batch terminal-lock classify/sweep pair. */
+export interface TerminalLockScanOptions {
+	/**
+	 * The ref holding the ARBITER's authoritative `main`, whose tree the terminal
+	 * probe reads. Defaults to `<arbiter>/main`, which is correct in a WORKING
+	 * CLONE.
+	 *
+	 * A BARE HUB MIRROR (`git clone --bare`, see `repo-mirror.ts`) has NO
+	 * `remote.origin.fetch` refspec and therefore no `refs/remotes/*` namespace at
+	 * all, so its copy of the arbiter's main is `refs/heads/main`. Mirror callers
+	 * MUST pass `'main'`, the same ref `lintRefLedger` and `fetchMirrorMainOrWarn`
+	 * already read there. Getting this wrong used to be SILENT (every probe failed
+	 * with `invalid object name`, so every lock classified as in-flight and the
+	 * sweep became a permanent no-op); `classifyTerminalItemLocks` now guards it
+	 * explicitly and reports it as an error instead.
+	 */
+	mainRef?: string;
+	/**
+	 * Skip the `mainRef` refresh because the CALLER has just done it. Set by the
+	 * combined pass ({@link reconcileTerminalState}), which refreshes once and
+	 * runs both sub-passes against that ONE snapshot, so the same ref is not
+	 * fetched twice per claim.
+	 */
+	mainAlreadyFresh?: boolean;
+}
+export interface TerminalLockClassification {
+	/**
+	 * Locks whose item is TERMINAL on `<arbiter>/main` (per
+	 * {@link terminalMainPaths}): the work is durably landed, so the hold is stale
+	 * and RELEASABLE. These are the locks a completed propose PR leaves behind.
+	 */
+	terminal: LockEntry[];
+	/**
+	 * Locks to KEEP: the item is not at rest on `main` (a live build, an open PR,
+	 * a parked item), or the entry is a pre-cutover name with no derivable
+	 * item-form and so cannot be classified at all.
+	 */
+	inFlight: LockEntry[];
+	/** Locks whose classification faulted; treated as KEEP (the safe direction). */
+	errors: {entry: string; message: string}[];
+}
+
+/**
+ * Classify every held per-item lock against the arbiter's `main`, WITHOUT
+ * touching anything (fix for the propose-path lock leak; observation
+ * `every-completed-task-leaves-its-lock-ref-reporting-in-progress`).
+ *
+ * THE TERMINAL TEST IS THE ONLY TEST, and it is deliberately the narrowest one
+ * that identifies finished work: a lock is `terminal` iff the item's body rests
+ * in a terminal folder on `<arbiter>/main` per {@link terminalMainPaths} (a task
+ * in `tasks/done/` or `tasks/cancelled/`, a spec in `specs/tasked/` or
+ * `specs/dropped/`). It is NOT keyed on a branch, a PR's existence, a PR's merge
+ * status, the holder, or age: an item on an OPEN PR still shows its body in the
+ * ready pool on `main`, so it classifies `inFlight` and its lock stays held.
+ * Calling a NON-terminal lock releasable would let two claimants build the same
+ * item, which is far worse than the leak being fixed, so every uncertainty
+ * (unreadable `main`, an unclassifiable entry, any fault) resolves to KEEP.
+ *
+ * COST is one `ls-remote` + one pruned lock-ref fetch (via
+ * {@link listItemLockEntries}, which the read paths call regardless) plus ONE
+ * `git fetch` of `main`, then a purely LOCAL `cat-file -e` per lock. It is
+ * deliberately not a loop over {@link classifyItemLockAgainstMain}, which
+ * fetches twice per lock (~100 fetches for a 26-lock corpus, far too slow for
+ * `status`).
+ *
+ * Best-effort and NEVER throws.
+ */
+export async function classifyTerminalItemLocks(
+	cwd: string,
+	arbiter = 'origin',
+	env?: NodeJS.ProcessEnv,
+	opts: TerminalLockScanOptions = {},
+): Promise<TerminalLockClassification> {
+	const out: TerminalLockClassification = {
+		terminal: [],
+		inFlight: [],
+		errors: [],
+	};
+	// DEFAULT `<arbiter>/main` (the WORKING-CLONE shape). A BARE HUB MIRROR must
+	// pass `mainRef: 'main'`, see `isTerminalAtRef` for why reading the wrong ref
+	// silently classifies everything as in-flight.
+	const mainRef = opts.mainRef ?? `${arbiter}/main`;
+	let entries: LockEntry[];
+	try {
+		entries = await listItemLockEntries(cwd, arbiter, env);
+	} catch {
+		return out;
+	}
+	if (entries.length === 0) {
+		return out;
+	}
+	// ONE refresh of `mainRef` for the WHOLE pass (the durable record every
+	// terminal probe below reads), via an EXPLICIT refspec that writes exactly
+	// that ref. If it fails we cannot prove ANY item terminal, so every lock is
+	// KEPT rather than guessed at.
+	const fetched = opts.mainAlreadyFresh
+		? {status: 0, stdout: '', stderr: ''}
+		: await refreshMainRef(mainRef, arbiter, cwd, env);
+	if (fetched.status !== 0) {
+		for (const lock of entries) {
+			out.errors.push({
+				entry: lock.entry,
+				message: `could not refresh ${mainRef} from ${arbiter} to classify against (treated as HELD): ${fetched.stderr.trim()}`,
+			});
+		}
+		return out;
+	}
+	// GUARD against the silent-no-op class: if the ref we are about to probe does
+	// not resolve AT ALL, every `cat-file -e` below fails with `invalid object
+	// name`, which is indistinguishable from "the item is not terminal". That
+	// would classify every lock as in-flight and make the sweep a permanent no-op
+	//, exactly the bare-mirror bug this parameter exists to fix. Fail LOUDLY into
+	// `errors` (still keeping every lock) so a wrong ref is diagnosable, never
+	// invisible.
+	const mainResolves =
+		(await gitSoft(['rev-parse', '--verify', '--quiet', mainRef], cwd, env))
+			.status === 0;
+	if (!mainResolves) {
+		for (const lock of entries) {
+			out.errors.push({
+				entry: lock.entry,
+				message: `'${mainRef}' does not resolve in ${cwd}, so nothing can be proven terminal (treated as HELD)`,
+			});
+		}
+		return out;
+	}
+	for (const lock of entries) {
+		// A pre-cutover entry (`slice-`/`prd-`) has no current item-form, so it has
+		// no derivable terminal path, leave it for `release-lock --entry <literal>`.
+		if (!hasCurrentItemForm(lock.entry)) {
+			out.inFlight.push(lock);
+			continue;
+		}
+		try {
+			const {type, slug} = resolveSidecarIdentity(
+				itemFromLockEntry(lock.entry),
+			);
+			// Purely LOCAL probes against the single `main` snapshot fetched above.
+			if (await isTerminalAtRef(type, slug, mainRef, cwd, env)) {
+				out.terminal.push(lock);
+			} else {
+				out.inFlight.push(lock);
+			}
+		} catch (err) {
+			out.errors.push({
+				entry: lock.entry,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * What a {@link reconcileTerminalItemLocks} sweep did, by lock `<entry>`.
+ * `released` + `kept` + `errors` partition the locks that were held on the
+ * arbiter when the sweep started.
+ */
+export interface TerminalReconcileReport {
+	/** Entries whose item is TERMINAL on `<arbiter>/main` and whose ref was deleted. */
+	released: string[];
+	/** Entry NAMES left HELD: the item is not terminal on `main` (in flight), the
+	 * entry could not be classified (a pre-cutover name with no item-form), or a
+	 * terminal lock's release was REFUSED. Mirrors {@link stillHeld}. */
+	kept: string[];
+	/**
+	 * The FULL entries still held after the sweep: {@link kept} as parsed
+	 * {@link LockEntry} objects, so a caller can render its in-flight surface
+	 * DIRECTLY from this result instead of re-listing the refs (which would cost a
+	 * second `ls-remote` + fetch and open a TOCTOU window between the two reads).
+	 */
+	stillHeld: LockEntry[];
+	/** Entries whose reconciliation faulted (left HELD, the safe direction). A
+	 * REFUSED release appears both here and in {@link stillHeld}: the lock is still
+	 * held, and the caller is told why rather than silently losing it. */
+	errors: {entry: string; message: string}[];
+}
+
+/**
+ * LAZY RECONCILIATION: the WRITE twin of {@link classifyTerminalItemLocks}. It
+ * takes that exact classification and RELEASES the `terminal` locks. This is the
+ * fix for the propose-path lock leak (observation
+ * `every-completed-task-leaves-its-lock-ref-reporting-in-progress`).
+ *
+ * THE BUG THIS EXISTS FOR. `complete --propose` deliberately KEEPS the per-item
+ * lock held (the done-move is on the PR branch, not on `main`, so the item is
+ * still in the pool and must stay excluded) and promises "It is released when the
+ * PR merges (reconciled against main)". That second half NEVER HAPPENED. Nobody
+ * runs a dorfl process at the moment a human clicks merge on GitHub and there is
+ * no daemon, so a release scheduled for merge-time can never fire. Meanwhile
+ * {@link reconcileItemLockAgainstMain} (which implements exactly the right
+ * decision) was reachable ONLY from the opt-in `gc --ledger --reap-stale-locks`
+ * sweep. An operator driving `do`/`complete` by hand never runs it, so every
+ * propose build leaked its lock ref forever and `status` reported finished work
+ * as in-progress permanently.
+ *
+ * WHERE THIS IS CALLED, and why not from the read commands. The merge event is
+ * not observable, but its CONSEQUENCE on `main` is, and that consequence is
+ * durable, so a late sweep converges just as well as a timely one. It therefore
+ * runs from the paths that ALREADY WRITE to the arbiter and already run on every
+ * unit of work: the CLAIM path (`do`/`claim`). `status` and `scan` stay strictly
+ * READ-ONLY and use {@link classifyTerminalItemLocks} to REPORT a finished item's
+ * lock as released-pending rather than as in-progress; they perform this sweep
+ * only under an explicit `--reconcile-locks` flag. Putting the automatic release
+ * on a write path (rather than behind a flag on a read path) is what makes the
+ * fix real: a flag nobody is routed to is what produced the leak in the first
+ * place, since `gc --ledger` had been reporting these locks and printing the
+ * `release-lock` command all along.
+ *
+ * SCOPE FENCE: this clears the TERMINAL class ONLY. The OTHER orphan class
+ * {@link reconcileItemLockAgainstMain} knows about (the crash-window orphan:
+ * non-terminal but SURFACED on `main` with `needsAnswers:true` + sidecar) is
+ * deliberately NOT swept here and remains the explicit
+ * `gc --ledger --reap-stale-locks` sweep's business. Terminal-on-`main` is a
+ * FACT about durable state that proves the work is finished; "surfaced" is a
+ * crash inference, and the no-auto-sweep trust model is worth keeping for it.
+ *
+ * SAFETY. Every delete is the SAME `--force-with-lease` delete
+ * ({@link leasedDeleteLockRef}) `release-lock`/requeue use, never a blind
+ * `--force`, so a lock a concurrent writer moved between our read and our write
+ * is reported, not stolen. The whole sweep is best-effort and NEVER throws: any
+ * fault leaves the lock HELD, which is the safe direction. It is idempotent:
+ * re-running over a reconciled arbiter is a clean empty report.
+ */
+export async function reconcileTerminalItemLocks(
+	cwd: string,
+	arbiter = 'origin',
+	env?: NodeJS.ProcessEnv,
+	opts: TerminalLockScanOptions = {},
+): Promise<TerminalReconcileReport> {
+	const classified = await classifyTerminalItemLocks(cwd, arbiter, env, opts);
+	const report: TerminalReconcileReport = {
+		released: [],
+		kept: classified.inFlight.map((l) => l.entry),
+		// Seeded with what the classifier already decided to keep. A terminal lock
+		// whose release is REFUSED below is appended, so `stillHeld` always reflects
+		// the arbiter's true post-sweep state rather than an optimistic one.
+		stillHeld: [...classified.inFlight],
+		errors: [...classified.errors],
+	};
+	/** A terminal lock we could not remove is STILL HELD, so it must appear in
+	 * BOTH the kept set and the in-flight surface, never silently vanish. */
+	const keepUnreleased = (lock: LockEntry) => {
+		report.kept.push(lock.entry);
+		report.stillHeld.push(lock);
+	};
+	for (const lock of classified.terminal) {
+		const ref = itemLockRef(lock.entry);
+		try {
+			const rev = await gitSoft(
+				['rev-parse', '--verify', '--quiet', ref],
+				cwd,
+				env,
+			);
+			if (rev.status !== 0 || rev.stdout.trim() === '') {
+				// The ref vanished between the classification and now (another
+				// reconciler won): the desired end state; nothing to report.
+				continue;
+			}
+			const cleared = await leasedDeleteLockRef(
+				ref,
+				rev.stdout.trim(),
+				cwd,
+				arbiter,
+				env,
+			);
+			if (cleared === 'deleted') {
+				report.released.push(lock.entry);
+				continue;
+			}
+			// The lease was REJECTED. Distinguish the benign case (a concurrent
+			// reconciler / `release-lock` already cleared the SAME lock): the desired
+			// end state) from a genuine concurrent mutation (back off, never force).
+			const remote = await gitSoft(['ls-remote', arbiter, ref], cwd, env);
+			if (remote.status === 0 && remote.stdout.trim() === '') {
+				await gitSoft(['update-ref', '-d', ref], cwd, env);
+				continue;
+			}
+			keepUnreleased(lock);
+			report.errors.push({
+				entry: lock.entry,
+				message: `terminal-lock release for '${lock.entry}' was rejected (the ref changed concurrently); left HELD, never forced.`,
+			});
+		} catch (err) {
+			keepUnreleased(lock);
+			report.errors.push({
+				entry: lock.entry,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	return report;
+}
+
 /** One lingering lock in the `gc --ledger` orphaned-lock REPORT: the held entry
  * plus the read-only cross-substrate {@link ReconcileOutcome} classification of
  * it against the authoritative `main` durable record. Reported, NEVER cleared
@@ -1844,15 +2147,80 @@ async function isTerminalOnMain(
 	cwd: string,
 	env: NodeJS.ProcessEnv | undefined,
 ): Promise<boolean> {
+	return isTerminalAtRef(type, slug, `${arbiter}/main`, cwd, env);
+}
+
+/**
+ * True iff `mainRef`'s tree contains any of {@link terminalMainPaths} for the
+ * item, the ref-parameterised core of {@link isTerminalOnMain}.
+ *
+ * WHY `mainRef` IS A PARAMETER and not hard-coded to `<arbiter>/main`: the two
+ * repo shapes dorfl works with hold the arbiter's `main` under DIFFERENT refs,
+ * and reading the wrong one silently answers "not terminal" for every item
+ * (observation `checkpoint-path-reports-its-own-write-as-absent`, the same class
+ * `arbiter-refs.ts` was written for).
+ *   - A WORKING CLONE has a normal fetch refspec, so the arbiter's main lands in
+ *     the REMOTE-TRACKING ref `refs/remotes/<arbiter>/main` ⇒ `<arbiter>/main`.
+ *   - A BARE HUB MIRROR (`git clone --bare`, see `repo-mirror.ts`) has NO
+ *     `remote.origin.fetch` refspec and therefore NO `refs/remotes/*` namespace
+ *     AT ALL: its copy of the arbiter's main is `refs/heads/main` ⇒ plain
+ *     `main`. This is why every other mirror reader in this codebase
+ *     (`lintRefLedger('main', mirrorPath)`, `fetchMirrorMainOrWarn`) speaks
+ *     `main`, not `origin/main`.
+ * Passing `<arbiter>/main` on a mirror makes `cat-file -e` fail with `invalid
+ * object name`, which is indistinguishable from "the file is not there", so
+ * every lock classifies as in-flight and the sweep becomes a silent no-op.
+ */
+async function isTerminalAtRef(
+	type: SidecarType,
+	slug: string,
+	mainRef: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv | undefined,
+): Promise<boolean> {
 	for (const path of terminalMainPaths(type, slug)) {
 		const exists =
-			(await gitSoft(['cat-file', '-e', `${arbiter}/main:${path}`], cwd, env))
+			(await gitSoft(['cat-file', '-e', `${mainRef}:${path}`], cwd, env))
 				.status === 0;
 		if (exists) {
 			return true;
 		}
 	}
 	return false;
+}
+
+/**
+ * Refresh `mainRef` from the arbiter with an EXPLICIT refspec that writes
+ * EXACTLY the ref the terminal probe will read, so the read can never land on a
+ * ref the fetch did not populate (the bare-mirror trap documented on
+ * {@link isTerminalAtRef}; the same stance as `arbiter-refs.ts`). A plain
+ * `git fetch <arbiter>` is deliberately NOT used: in a bare mirror it writes
+ * `refs/heads/*` and never populates `refs/remotes/*`, and in a working clone it
+ * depends on whatever refspec happens to be configured.
+ *
+ * Returns the git result so the caller can treat a failure as "cannot prove
+ * anything terminal" and keep every lock.
+ */
+export async function refreshMainRef(
+	mainRef: string,
+	arbiter: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv | undefined,
+): Promise<RunResult> {
+	// `<arbiter>/main` ⇒ remote-tracking destination; a bare `main` (or any other
+	// local branch name) ⇒ `refs/heads/` destination, the mirror shape.
+	const remotePrefix = `${arbiter}/`;
+	const dest = mainRef.startsWith(remotePrefix)
+		? `refs/remotes/${mainRef}`
+		: `refs/heads/${mainRef}`;
+	const branch = mainRef.startsWith(remotePrefix)
+		? mainRef.slice(remotePrefix.length)
+		: mainRef;
+	return gitSoft(
+		['fetch', '--quiet', arbiter, `+refs/heads/${branch}:${dest}`],
+		cwd,
+		env,
+	);
 }
 
 /** List the entries (`<type>-<slug>`) currently locked on the arbiter (the

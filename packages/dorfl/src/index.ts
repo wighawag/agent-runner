@@ -341,6 +341,8 @@ export {
 	releaseHeldItemLock,
 	readItemLock,
 	reconcileItemLockAgainstMain,
+	reconcileTerminalItemLocks,
+	classifyTerminalItemLocks,
 	classifyItemLockAgainstMain,
 	reportItemLocks,
 	formatItemLockReport,

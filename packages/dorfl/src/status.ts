@@ -6,7 +6,12 @@ import './pi-harness.js';
 import {type JobState} from './workspace.js';
 import {fetchMirrorMainOrWarn} from './repo-mirror.js';
 import {formatArbiterStatus, type ArbiterStatusReport} from './arbiter.js';
-import {listItemLockEntries, type LockEntry} from './item-lock.js';
+import {
+	listItemLockEntries,
+	classifyTerminalItemLocks,
+	reconcileTerminalItemLocks,
+	type LockEntry,
+} from './item-lock.js';
 import {formatCwdSection, formatLockEntryLines} from './format.js';
 import type {CwdSection} from './cwd-section.js';
 import {
@@ -96,6 +101,16 @@ export interface RepoLockEntries {
 	entries: LockEntry[];
 }
 
+/** One repo's STALE per-item locks: entries whose item has already come to rest
+ * in a terminal folder on that repo's `main`, so the hold is finished work
+ * awaiting release rather than an in-flight claim. */
+export interface RepoStaleLocks {
+	/** The repo path whose lock refs were classified (a hub-mirror path). */
+	repoPath: string;
+	/** The stale lock `<entry>` names, sorted. */
+	entries: string[];
+}
+
 /** One repo's one-slug-one-folder LINT result, surfaced for the dashboard. */
 export interface RepoLedgerDuplicates {
 	/** The repo path whose `work/` ledger was linted (a hub-mirror path). */
@@ -123,6 +138,16 @@ export interface StatusReport {
 	 * populates it (possibly empty).
 	 */
 	lockHeld?: RepoLockEntries[];
+	/**
+	 * Per registered hub mirror, the lock `<entry>` names whose item is already at
+	 * REST in a terminal folder on that mirror's `main`, finished work (typically
+	 * a merged propose PR) whose lock has not been released yet. Reported
+	 * SEPARATELY from {@link StatusReport.lockHeld}, and deliberately excluded from
+	 * it, so completed work never reads as in-progress (the symptom of the
+	 * propose-path lock leak). `status` RELEASES nothing by default, it is
+	 * read-only; these drain on the next claim, or under `--reconcile-locks`.
+	 */
+	staleLocks?: RepoStaleLocks[];
 	/**
 	 * The one-slug-one-folder LINT (spec `ledger-integrity` story 3): per registered
 	 * hub mirror, any slug present in MORE THAN ONE `work/` status folder (a corrupt
@@ -170,6 +195,15 @@ export interface StatusOptions {
 	 * Omitted ⇒ only the job worktrees are reported.
 	 */
 	mirrorPaths?: string[];
+	/**
+	 * OPT-IN WRITE (`status --reconcile-locks`). `false`/omitted (the DEFAULT)
+	 * keeps `status` strictly READ-ONLY: stale locks are classified and REPORTED
+	 * via {@link StatusReport.staleLocks} and nothing on any arbiter is touched.
+	 * `true` additionally RELEASES them. Not needed for routine convergence, the
+	 * claim path already sweeps on every unit of work; this is the manual
+	 * "drain them now" lever.
+	 */
+	reconcileLocks?: boolean;
 	/**
 	 * Sink for the fetch-first fall-back warning (ADR §5/§6): when a mirror's `main`
 	 * cannot be fetched, `status` warns through this and reads that mirror's
@@ -229,25 +263,85 @@ export async function status(options: StatusOptions): Promise<StatusReport> {
 	// held (`active` = in-progress) AND stuck (`needs-attention`) entries + their
 	// reasons/questions.
 	const lockHeld: RepoLockEntries[] = [];
+	const staleLocks: RepoStaleLocks[] = [];
 	const ledgerDuplicates: RepoLedgerDuplicates[] = [];
 	for (const mirrorPath of options.mirrorPaths ?? []) {
 		// Fetch-first (ADR §5/§6): refresh this mirror's `main` so the duplicate lint
 		// reflects the remote truth. Never fatal — a failed fetch WARNS and falls back
 		// to the mirror's last-known `main`.
 		fetchMirrorMainOrWarn({mirrorPath, warn: options.warn, env: options.env});
+		// CLASSIFY the mirror's held locks against its `main` (fix for the propose-path
+		// lock leak; observation
+		// `every-completed-task-leaves-its-lock-ref-reporting-in-progress`). A
+		// `complete --propose` KEEPS its lock held across the open PR and defers the
+		// release to the merge, an event no dorfl process is present for (no hook, no
+		// daemon), so the release never fired and every completed item reported
+		// in-progress for ever.
+		//
+		// `status` is READ-ONLY and stays that way: by DEFAULT we only classify, so a
+		// lock whose item has come to REST in a terminal folder on the mirror's `main`
+		// is reported as STALE rather than listed in-flight. The refs themselves are
+		// drained by the paths that already write on every unit of work (the claim
+		// path), or here under the explicit `--reconcile-locks` opt-in. An item on an
+		// OPEN PR (still in the pool on `main`) stays in-flight either way.
+		// Best-effort and never throws, any fault treats the lock as HELD.
+		//
+		// A hub mirror is a BARE clone with no `refs/remotes/*` namespace, so its copy
+		// of the arbiter's main is the plain `main` ref (the SAME ref
+		// `fetchMirrorMainOrWarn` above and `lintRefLedger` below read). Passing the
+		// default `origin/main` here would fail EVERY probe with `invalid object name`
+		// and silently classify every lock as in-flight.
+		const MIRROR_MAIN = {mainRef: 'main'};
+		let staleEntries: string[] = [];
+		let entries: LockEntry[];
+		if (options.reconcileLocks === true) {
+			const reconciled = await reconcileTerminalItemLocks(
+				mirrorPath,
+				'origin',
+				options.env,
+				MIRROR_MAIN,
+			);
+			if (reconciled.released.length > 0) {
+				options.warn?.(
+					`${mirrorPath}: released ${reconciled.released.length} stale per-item ` +
+						'lock(s) whose item is terminal on main (work landed; the ' +
+						`propose PR merged out-of-band): ${reconciled.released.join(', ')}`,
+				);
+			}
+			// Under an EXPLICIT drain request a refusal must be reported: the operator
+			// asked for these to go away, so silence would be a lie.
+			for (const e of reconciled.errors) {
+				options.warn?.(
+					`${mirrorPath}: could not release '${e.entry}': ${e.message}`,
+				);
+			}
+			entries = reconciled.stillHeld;
+		} else {
+			const classified = await classifyTerminalItemLocks(
+				mirrorPath,
+				'origin',
+				options.env,
+				MIRROR_MAIN,
+			);
+			staleEntries = classified.terminal.map((l) => l.entry);
+			entries = classified.inFlight;
+		}
 		// The PER-ITEM LOCK in-flight view (spec US #8): read the mirror's lock refs to
 		// surface held (`active` = in-progress) and stuck (`needs-attention`) entries +
 		// reasons/questions. A bare hub mirror's arbiter is its `origin` (the SAME
 		// handle the `scan` held-slug subtraction reads). Best-effort: a fetch/read
 		// fault yields an EMPTY list (see {@link listItemLockEntries}), so this
 		// read-only view degrades to "no in-flight locks" rather than erroring.
-		const entries = await listItemLockEntries(
-			mirrorPath,
-			'origin',
-			options.env,
-		);
+		// `entries` comes STRAIGHT from the classification above (its `inFlight`
+		// partition, or `stillHeld` after a sweep), so the stale ones are already
+		// excluded: finished work is not an in-flight hold, and listing it as one is
+		// the exact symptom being fixed. Reusing that result also avoids a SECOND
+		// `ls-remote` + fetch per mirror, and the TOCTOU window between two reads.
 		if (entries.length > 0) {
 			lockHeld.push({repoPath: mirrorPath, entries});
+		}
+		if (staleEntries.length > 0) {
+			staleLocks.push({repoPath: mirrorPath, entries: staleEntries});
 		}
 		// The one-slug-one-folder LINT (spec story 3): derive any slug residing in >1
 		// status folder from the SAME freshly-fetched `main` ref, surfaced LOUDLY.
@@ -257,12 +351,14 @@ export async function status(options: StatusOptions): Promise<StatusReport> {
 		}
 	}
 	lockHeld.sort((a, b) => a.repoPath.localeCompare(b.repoPath));
+	staleLocks.sort((a, b) => a.repoPath.localeCompare(b.repoPath));
 	ledgerDuplicates.sort((a, b) => a.repoPath.localeCompare(b.repoPath));
 
 	return {
 		active,
 		attention,
 		lockHeld,
+		staleLocks,
 		ledgerDuplicates,
 		...(options.arbiter ? {arbiter: options.arbiter} : {}),
 		...(options.cwd ? {cwd: options.cwd} : {}),
@@ -319,6 +415,8 @@ export function formatStatus(report: StatusReport): string {
 
 	const lockHeld = report.lockHeld ?? [];
 	const lockCount = lockHeld.reduce((sum, r) => sum + r.entries.length, 0);
+	const staleLocks = report.staleLocks ?? [];
+	const staleCount = staleLocks.reduce((sum, r) => sum + r.entries.length, 0);
 	const ledgerDuplicates = report.ledgerDuplicates ?? [];
 	const dupCount = ledgerDuplicates.reduce(
 		(sum, r) => sum + r.duplicates.length,
@@ -328,6 +426,10 @@ export function formatStatus(report: StatusReport): string {
 		report.active.length === 0 &&
 		report.attention.length === 0 &&
 		lockCount === 0 &&
+		// A repo whose ONLY locks are stale must not print "the work area is empty":
+		// that would turn the old "wrongly shown as in-progress" bug into a worse
+		// "not shown at all" one.
+		staleCount === 0 &&
 		dupCount === 0 &&
 		report.arbiter === undefined &&
 		cwdLines.length === 0
@@ -375,6 +477,29 @@ export function formatStatus(report: StatusReport): string {
 				lines.push(...formatLockEntryLines(entry, '    '));
 			}
 		}
+	}
+
+	// STALE locks: finished work whose lock has not been released yet (the
+	// propose-path lock leak). Rendered as its OWN block and deliberately NOT under
+	// "In-flight locks" above, because reporting completed work as in-progress for
+	// ever was the symptom. `status` is read-only, so it names the state and how it
+	// clears rather than clearing it.
+	if (staleCount > 0) {
+		lines.push('');
+		lines.push(
+			`Completed, lock not yet released (${staleCount}; the item is at rest on ` +
+				'main, so this is NOT in flight):',
+		);
+		for (const repo of staleLocks) {
+			lines.push(`  ${repo.repoPath}`);
+			for (const entry of repo.entries) {
+				lines.push(`    ${entry}`);
+			}
+		}
+		lines.push(
+			'  These clear automatically on the next claim. To drain them now: ' +
+				'`dorfl status --reconcile-locks`.',
+		);
 	}
 
 	// The one-slug-one-folder LINT (spec `ledger-integrity` story 3): WARN LOUDLY

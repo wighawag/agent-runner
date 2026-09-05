@@ -1260,10 +1260,17 @@ async function releaseClaimLockAfterDurableMove(
 	if (!durablyOnMain) {
 		// PROPOSE, PR open: the done-move is on the PR branch, not on `main`. KEEP the
 		// lock held so the in-flight task is not re-claimed during the review window.
+		// The wording used to promise "It is released when the PR merges (reconciled
+		// against main)", which was FALSE: no dorfl process is present at merge time
+		// (no hook, no daemon), so nothing could act on that event and every propose
+		// build leaked its lock ref for ever. The release actually happens on the next
+		// command that writes to the arbiter (the claim path sweeps stale terminal
+		// locks), so the message now names a trigger that really fires.
 		note(
 			`'${slug}': keeping the per-item lock HELD (propose PR open; the work is ` +
-				'not yet on main). It is released when the PR merges (reconciled against ' +
-				'main).',
+				'not yet on main). Once the PR merges, the item comes to rest on main and ' +
+				'the lock is released by the next claim (or now, with `dorfl status ' +
+				'--reconcile-locks`).',
 		);
 		return;
 	}

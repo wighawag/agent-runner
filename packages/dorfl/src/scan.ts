@@ -27,6 +27,8 @@ import type {LifecyclePoolGates} from './lifecycle-pools.js';
 import {
 	heldTaskSlugs,
 	listItemLockEntries,
+	classifyTerminalItemLocks,
+	reconcileTerminalItemLocks,
 	type LockEntry,
 } from './item-lock.js';
 
@@ -203,6 +205,15 @@ export interface RepoReport {
 	 * {@link listItemLockEntries}). Optional so older literals stay valid.
 	 */
 	lockHeld?: LockEntry[];
+	/**
+	 * Lock `<entry>` names whose item is already at REST in a terminal folder on
+	 * this repo's `main`: finished work (typically a merged propose PR) whose lock
+	 * has not been released yet. Reported SEPARATELY from {@link lockHeld}, and
+	 * deliberately excluded from it, so completed work never reads as in-progress.
+	 * `scan` is read-only and RELEASES nothing; these drain on the next claim, or
+	 * under `scan --reconcile-locks`.
+	 */
+	staleLocks?: string[];
 }
 
 /** The full cross-repo scan result. */
@@ -406,6 +417,14 @@ export async function scan(
 	config: Config,
 	options: {
 		warn?: (message: string) => void;
+		/**
+		 * OPT-IN WRITE (`scan --reconcile-locks`). Omitted/`false` (the DEFAULT) keeps
+		 * `scan` strictly READ-ONLY: stale terminal locks are classified and excluded
+		 * from the in-flight surface, but nothing on any arbiter is touched. `true`
+		 * additionally RELEASES them. Routine convergence does not need this, the
+		 * claim path sweeps on every unit of work.
+		 */
+		reconcileLocks?: boolean;
 		env?: NodeJS.ProcessEnv;
 		/**
 		 * The per-machine {@link ConfigOverrideMap} (from `loadConfigOverride`),
@@ -448,6 +467,65 @@ export async function scan(
 		// Held-slug subtraction: a bare hub mirror's arbiter is its `origin`. Reads
 		// the lock refs from the mirror's origin; non-fatal (empty set on any fault),
 		// so the read-only scan degrades gracefully exactly as its config reads do.
+		// CLASSIFY the mirror's held locks against its `main` (fix for the propose-path
+		// lock leak; observation
+		// `every-completed-task-leaves-its-lock-ref-reporting-in-progress`). A
+		// `complete --propose` KEEPS its per-item lock held across the open PR and
+		// defers the release to the PR merge, an event NO dorfl process is present
+		// for (there is no merge hook and no daemon), so the release never fired and
+		// every completed item stayed locked and reported in-progress for ever.
+		//
+		// `scan` is READ-ONLY (it says so in its own description) and stays that way:
+		// we only CLASSIFY here, so a lock whose item has come to REST in a terminal
+		// folder on `main` is reported as STALE instead of being listed as an
+		// in-flight hold. The refs are drained by the paths that already write on
+		// every unit of work (the claim path). Best-effort and never throws: any
+		// fault treats every lock as HELD, so `scan` degrades to its previous
+		// behaviour.
+		//
+		// Under the explicit `--reconcile-locks` opt-in, the ONE way `scan` writes
+		// the same classification is applied instead of merely reported.
+		//
+		// A hub mirror is a BARE clone with no `refs/remotes/*` namespace, so its
+		// copy of the arbiter's main is the plain `main` ref (the SAME ref
+		// `lintRefLedger` below reads). Passing the default `origin/main` would fail
+		// EVERY probe with `invalid object name` and silently classify every lock as
+		// in-flight, making this a permanent no-op.
+		const MIRROR_MAIN = {mainRef: 'main'};
+		let staleLockEntries: string[];
+		let lockHeld: LockEntry[];
+		if (options.reconcileLocks === true) {
+			const swept = await reconcileTerminalItemLocks(
+				mirror.path,
+				'origin',
+				options.env,
+				MIRROR_MAIN,
+			);
+			if (swept.released.length > 0) {
+				options.warn?.(
+					`${mirror.path}: released ${swept.released.length} stale per-item ` +
+						'lock(s) whose item is terminal on main (the work landed; a ' +
+						`propose PR merged out-of-band): ${swept.released.join(', ')}`,
+				);
+			}
+			// Under an EXPLICIT drain request, a refusal must be reported.
+			for (const e of swept.errors) {
+				options.warn?.(
+					`${mirror.path}: could not release '${e.entry}': ${e.message}`,
+				);
+			}
+			staleLockEntries = [];
+			lockHeld = swept.stillHeld;
+		} else {
+			const classified = await classifyTerminalItemLocks(
+				mirror.path,
+				'origin',
+				options.env,
+				MIRROR_MAIN,
+			);
+			staleLockEntries = classified.terminal.map((l) => l.entry);
+			lockHeld = classified.inFlight;
+		}
 		const heldSlugs = await heldTaskSlugs(mirror.path, 'origin', options.env);
 		// The PER-ITEM LOCK in-flight view (spec US #8; task
 		// `needs-attention-as-stuck-lock-state`): ADDITIONALLY read the full held
@@ -457,11 +535,9 @@ export async function scan(
 		// best-effort (empty list on any fault), so the read-only scan degrades
 		// gracefully. This is a SURFACE only — eligibility/selection stay offline on
 		// `main` (the subtraction above), not gated on this view.
-		const lockHeld = await listItemLockEntries(
-			mirror.path,
-			'origin',
-			options.env,
-		);
+		// `lockHeld` comes STRAIGHT from the classification above, so the stale ones
+		// are already excluded (finished work is not an in-flight hold) and we avoid a
+		// second `ls-remote` + fetch per mirror.
 		// Spec pool — the TASKABLE-SPEC companion of the task pool above
 		// (`ci-propose-matrix-must-enumerate-sliceable-prds-not-only-slices`). Resolve
 		// `autoTask` PER REPO from the mirror's COMMITTED `dorfl.json`
@@ -533,6 +609,7 @@ export async function scan(
 			lifecycle,
 			ledgerDuplicates,
 			lockHeld,
+			staleLocks: staleLockEntries,
 		});
 	}
 

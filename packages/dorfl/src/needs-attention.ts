@@ -19,6 +19,7 @@ import {
 	readItemLock,
 	itemLockRef,
 	lockEntryFor,
+	refreshMainRef,
 	parseLockEntry,
 	type LockEntry,
 } from './item-lock.js';
@@ -33,6 +34,7 @@ import {
 	resolveSidecarIdentity,
 	serialiseSidecar,
 	sidecarPathFor,
+	sidecarPathCandidates,
 	type NewQuestion,
 	type SidecarType,
 } from './sidecar.js';
@@ -2133,6 +2135,478 @@ export function prepareTreelessSurfaceCommit(params: {
 			env,
 		).stdout.trim();
 		const ref = `refs/dorfl/${refNamespace}/${slug}`;
+		gitHard(['update-ref', ref, commit], cwd, env);
+		return {ref, commit};
+	} finally {
+		rmSync(scratchIndex, {force: true});
+	}
+}
+
+/**
+ * The kind of TERMINAL resting place an item has reached on `main`, which
+ * decides how much of its question state is residue.
+ *   - `completed`, the work HAPPENED (`tasks/done/`, `specs/tasked/`). Any
+ *     surviving question state is pure residue: the questions were about how to
+ *     proceed, and the item proceeded.
+ *   - `wont-proceed`, the item was ABANDONED (`tasks/cancelled/`,
+ *     `specs/dropped/`). Here `needsAnswers:true` may be ACCURATE HISTORY: an
+ *     item can be cancelled precisely BECAUSE its questions were never answered,
+ *     and the body may carry a real `## Open questions` section recording that.
+ */
+export type TerminalKind = 'completed' | 'wont-proceed';
+
+/** The terminal `work/` paths for an item, tagged by {@link TerminalKind}, so a
+ * reader can tell "the work happened" from "the item was abandoned". Mirrors
+ * `terminalMainPaths` in `item-lock.ts` (same folders, same per-regime split);
+ * this variant carries the KIND the question-state drain branches on. */
+export function terminalMainPathsByKind(
+	type: SidecarType,
+	slug: string,
+): {path: string; kind: TerminalKind}[] {
+	const file = `${slug}.md`;
+	switch (type) {
+		case 'task':
+			return [
+				{path: workItemRel('done', file), kind: 'completed'},
+				{path: workItemRel('cancelled', file), kind: 'wont-proceed'},
+			];
+		case 'spec':
+			return [
+				{path: workItemRel('specs-tasked', file), kind: 'completed'},
+				{path: workItemRel('specs-dropped', file), kind: 'wont-proceed'},
+			];
+		case 'observation':
+			// A note has no durable terminal folder: it leaves by DELETION, so there
+			// is no resting record to reconcile against.
+			return [];
+	}
+}
+
+/** One item whose question state survived into a terminal resting place. */
+export interface TerminalQuestionResidue {
+	/** The namespaced identity (`task:<slug>`). */
+	item: string;
+	/** The sidecar's path on `main` (`work/questions/<type>-<slug>.md`). */
+	sidecarPath: string;
+	/** The item body's terminal path on `main`. */
+	itemPath: string;
+	/** Which terminal the body rests in. */
+	terminal: TerminalKind;
+	/** Does the body still carry `needsAnswers: true`? */
+	flagged: boolean;
+	/**
+	 * Does the sidecar carry at least one ANSWERED entry? Such a sidecar holds
+	 * human-written prose that was never consumed by the apply rung, so the drain
+	 * refuses to touch it (see {@link classifyTerminalQuestionResidue}).
+	 */
+	answered: boolean;
+}
+
+/** The read-only classification of the arbiter's stranded question state. */
+export interface TerminalQuestionReport {
+	/** Residue the drain WILL clear: terminal + no answered entry. */
+	drainable: TerminalQuestionResidue[];
+	/**
+	 * Residue the drain deliberately LEAVES: a terminal item whose sidecar carries
+	 * a human's ANSWER that was never applied. Reported for a human, never
+	 * silently deleted (the answer is data the tool did not author).
+	 */
+	answeredHeld: TerminalQuestionResidue[];
+	errors: {item: string; message: string}[];
+}
+
+/**
+ * Classify the arbiter's STRANDED QUESTION STATE, read-only (observation
+ * `a-rebuilt-task-leaves-its-bounce-question-asking-to-cancel-a-merged-task`).
+ *
+ * THE BUG THIS EXISTS FOR. When a build bounces, the surface path atomically
+ * writes BOTH halves of the question state in ONE commit: the sidecar
+ * `work/questions/<type>-<slug>.md` AND `needsAnswers: true` on the item body.
+ * That is correct, and the atomicity is what makes this reconciliation decidable
+ * at all. But if the human DISAGREES with the bounce and simply re-dispatches,
+ * and the rebuild SUCCEEDS (PR opened, gate green, merged, body done-moved),
+ * NEITHER half is ever cleared. The item comes to rest in `tasks/done/` still
+ * carrying a question asking whether to CANCEL it, with a destructive default.
+ *
+ * The flag is the harmful half. A stranded sidecar is a stale question in a
+ * folder a human scans; a stranded `needsAnswers` is a GATE LEFT ARMED, and it
+ * makes `status` report shipped (sometimes released) work under "open questions
+ * block autonomous work".
+ *
+ * Dorfl ALREADY knows this state is illegal: `advance-classify.ts` refuses it as
+ * `invariant-violation` / `sidecar-without-needsAnswers`. The defect is purely
+ * that the detector lives in the `advance` tick's classifier, and a human driving
+ * `do` and merging a PR never enters that loop. So this is the same shape as the
+ * propose-path lock leak, settled by the same reconcile pass at the same moment
+ * (the done-move), rather than by a second mechanism.
+ *
+ * THE TRAP, and why the TERMINAL POSITION is the discriminator rather than the
+ * flag/sidecar disagreement: the MIRROR state (`needsAnswers:true` with NO
+ * sidecar) is LEGAL and COMMON. An item authored with open questions carries the
+ * flag and has no sidecar until `surface` runs, and that flagged-but-unsurfaced
+ * item is precisely the `surface` rung's INPUT. Clearing the flag there would
+ * silently disarm every un-surfaced item in the repo and hand gated work to
+ * agents. So this only ever considers items whose body has reached a TERMINAL
+ * folder on `main`; an item resting in a pool or staging folder keeps whatever
+ * state it has, untouched.
+ *
+ * The enumeration is anchored on the SIDECAR SET (`work/questions/` on `main`),
+ * which is small, cheap to list, and is the half that makes the residue
+ * discoverable unambiguously. A terminal item carrying a bare flag and no sidecar
+ * is deliberately NOT swept: that shape is the legal one above, and there is no
+ * second signal to distinguish residue from a hand-authored declaration.
+ *
+ * Best-effort and never throws.
+ */
+export async function classifyTerminalQuestionResidue(params: {
+	cwd: string;
+	arbiter: string;
+	/** The ref holding the arbiter's authoritative `main`. */
+	mainRef: string;
+	env?: NodeJS.ProcessEnv;
+	/** Skip the `mainRef` refresh because the CALLER just did it (the combined
+	 * pass refreshes once and runs both sub-passes against that ONE snapshot). */
+	mainAlreadyFresh?: boolean;
+}): Promise<TerminalQuestionReport> {
+	const {cwd, mainRef, env} = params;
+	// REFRESH `mainRef` FIRST, with an explicit refspec that writes exactly the ref
+	// we are about to read. Without this the pass reads a STALE view: the caller
+	// may not have fetched, and the lock sub-pass of the combined reconciliation
+	// early-returns (so does not refresh) when no locks are held. A failed refresh
+	// is NOT fatal, but it does mean the view may be stale in EITHER direction (an
+	// item may have left a terminal folder, or acquired an answer, since we last
+	// looked), which is exactly why the WRITE path re-derives this same
+	// classification against its own freshly-resolved base rather than trusting
+	// this snapshot.
+	await refreshMainRef(mainRef, params.arbiter, cwd, env);
+	return deriveTerminalQuestionResidue(mainRef, cwd, env);
+}
+
+/**
+ * The SYNC, PURE-of-network derivation of the question residue AT ONE COMMIT.
+ *
+ * Split out of {@link classifyTerminalQuestionResidue} so the WRITE path can
+ * re-derive the SAME classification against the base it is actually about to
+ * commit on, per contention attempt. That matters for correctness, not tidiness:
+ * a classification taken before a contention retry can be stale in two ways that
+ * both break a documented guarantee. An item may have LEFT its terminal folder
+ * (re-opened), in which case its sidecar is live again and must not be deleted;
+ * and a human may have written an ANSWER into a sidecar in the window, which must
+ * never be auto-deleted. Re-deriving against `base` closes both, because the
+ * commit is built on exactly that base.
+ */
+function deriveTerminalQuestionResidue(
+	base: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv | undefined,
+): TerminalQuestionReport {
+	const mainRef = base;
+	const out: TerminalQuestionReport = {
+		drainable: [],
+		answeredHeld: [],
+		errors: [],
+	};
+	const questionsDir = workFolderRel('questions');
+	const ls = run(
+		'git',
+		['ls-tree', '--name-only', `${mainRef}:${questionsDir}`],
+		cwd,
+		{env},
+	);
+	if (ls.status !== 0) {
+		// No `work/questions/` on main at all: nothing surfaced, nothing to drain.
+		return out;
+	}
+	for (const name of ls.stdout.split('\n').map((l) => l.trim())) {
+		if (name === '' || !isWorkItemFile(name)) {
+			continue;
+		}
+		const sidecarPath = `${questionsDir}/${name}`;
+		try {
+			// `<type>-<slug>.md` → `<type>:<slug>`. Only the CURRENT namespaces are
+			// addressable; a legacy `prd-` file has no current item-form and is left
+			// for the migration command.
+			const stem = name.replace(/\.md$/, '');
+			const dash = stem.indexOf('-');
+			const type = stem.slice(0, dash) as SidecarType;
+			const slug = stem.slice(dash + 1);
+			if (!['task', 'spec', 'observation'].includes(type) || slug === '') {
+				continue;
+			}
+			const item = `${type}:${slug}`;
+			// Is the body at rest in a terminal folder on `main`?
+			const terminalHit = terminalMainPathsByKind(type, slug).find((c) =>
+				pathInCommit(mainRef, c.path, cwd, env),
+			);
+			if (terminalHit === undefined) {
+				// NOT terminal: a live item. Its question state is its own business
+				// a pending sidecar is a human's outstanding decision, and clearing a
+				// flag here is the trap above. Untouched.
+				continue;
+			}
+			// N5 GUARD: a mid-migration spec can have BOTH `spec-<slug>.md` and the
+			// legacy `prd-<slug>.md` on main (`sidecarPathCandidates` still resolves
+			// the legacy name for readers). Draining only the canonical one while
+			// clearing the flag would leave the legacy sidecar live against
+			// `needsAnswers:false`, which is precisely the
+			// `sidecar-without-needsAnswers` invariant violation this change exists
+			// to remove. If any OTHER candidate for this item still exists, leave the
+			// whole item to `dorfl prd-to-spec`, which renames the DATA.
+			const hasLegacyAlias = sidecarPathCandidates(item).some(
+				(c) => c !== sidecarPath && pathInCommit(mainRef, c, cwd, env),
+			);
+			if (hasLegacyAlias) {
+				continue;
+			}
+			const model = parseSidecar(
+				catBlob(`${mainRef}:${sidecarPath}`, cwd, env),
+			);
+			const answered = model.entries.some((e) => isEntryAnswered(e));
+			const body = catBlob(`${mainRef}:${terminalHit.path}`, cwd, env);
+			const flagged = parseFrontmatter(body).needsAnswers === true;
+			const residue: TerminalQuestionResidue = {
+				item,
+				sidecarPath,
+				itemPath: terminalHit.path,
+				terminal: terminalHit.kind,
+				flagged,
+				answered,
+			};
+			if (answered) {
+				// A human WROTE an answer here and the apply rung never consumed it.
+				// Deleting it would discard prose the tool did not author, so this is
+				// surfaced for a human instead. (That the drain never runs on the
+				// human-answer path either is a SEPARATE defect; this pass must not
+				// paper over it by destroying the evidence.)
+				out.answeredHeld.push(residue);
+			} else {
+				out.drainable.push(residue);
+			}
+		} catch (err) {
+			out.errors.push({
+				item: sidecarPath,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+	return out;
+}
+
+/** What a {@link reconcileTerminalQuestionResidue} pass did. */
+export interface TerminalQuestionDrainResult {
+	/** Items whose sidecar was deleted. */
+	drained: string[];
+	/** Items whose `needsAnswers` flag was additionally cleared. */
+	unflagged: string[];
+	/** Terminal items left alone because a human's answer is unapplied. */
+	answeredHeld: string[];
+	errors: {item: string; message: string}[];
+}
+
+/**
+ * Drain the stranded question state {@link classifyTerminalQuestionResidue}
+ * finds, in ONE tree-less commit CAS-published to the arbiter's `main` through
+ * the SAME {@link runTreelessLedgerMove} core the surface path uses (same
+ * contention-retry, same lease, same write seam; there is no second mechanism).
+ *
+ * WHAT IT CLEARS, and the deliberate asymmetry between the two terminals:
+ *   - the SIDECAR is deleted for EITHER terminal. A question asking whether to
+ *     cancel an item that has already come to rest is stale in both cases, and it
+ *     sits in a folder a human scans carrying a destructive default.
+ *   - the `needsAnswers` FLAG is cleared ONLY for a `completed` terminal
+ *     (`tasks/done/`, `specs/tasked/`). On a `wont-proceed` terminal
+ *     (`tasks/cancelled/`, `specs/dropped/`) the flag is KEPT, because an item
+ *     can be cancelled precisely BECAUSE its questions were never answered: there
+ *     the flag is accurate history, not residue, and the body may carry a real
+ *     `## Open questions` section saying so. Keeping it is harmless, a terminal
+ *     item is in no pool, so the flag gates nothing.
+ *
+ * A sidecar with ANY answered entry is never touched (see the classifier).
+ *
+ * Best-effort: it never throws, and any fault leaves the state exactly as it was.
+ */
+export async function reconcileTerminalQuestionResidue(params: {
+	cwd: string;
+	arbiter: string;
+	mainRef: string;
+	env?: NodeJS.ProcessEnv;
+	/** Skip the `mainRef` refresh because the CALLER just did it (the combined
+	 * pass refreshes once and runs both sub-passes against that ONE snapshot). */
+	mainAlreadyFresh?: boolean;
+	note?: (message: string) => void;
+}): Promise<TerminalQuestionDrainResult> {
+	const {cwd, arbiter, mainRef, env} = params;
+	const note = params.note ?? (() => {});
+	const result: TerminalQuestionDrainResult = {
+		drained: [],
+		unflagged: [],
+		answeredHeld: [],
+		errors: [],
+	};
+	let report: TerminalQuestionReport;
+	try {
+		report = await classifyTerminalQuestionResidue({
+			cwd,
+			arbiter,
+			mainRef,
+			env,
+			mainAlreadyFresh: params.mainAlreadyFresh,
+		});
+	} catch (err) {
+		result.errors.push({
+			item: '(classify)',
+			message: err instanceof Error ? err.message : String(err),
+		});
+		return result;
+	}
+	result.answeredHeld = report.answeredHeld.map((r) => r.item);
+	result.errors.push(...report.errors);
+	if (report.drainable.length === 0) {
+		return result;
+	}
+	// What the LANDED commit ACTUALLY did, filled in by the plan against the base
+	// it committed on. The pre-plan `report` above is only a fast "is there
+	// anything to do?" probe; reporting from it would claim a gate was disarmed
+	// when a contention retry re-derived the residue and skipped the item.
+	let applied: TerminalQuestionResidue[] = [];
+	// NEVER THROW. `runTreelessLedgerMove` and the git plumbing inside the plan
+	// both throw on any non-zero git, and this pass runs from the CLAIM path as
+	// OPPORTUNISTIC HYGIENE on unrelated items. A fault here (a stale scratch ref,
+	// a protected `main`, a permission refusal) must degrade to "left it alone",
+	// never fail the caller's actual work.
+	let landed = false;
+	try {
+		landed = await runTreelessLedgerMove({
+			cwd,
+			// The ref name only has to be unique for the scratch ref; this pass is
+			// batch (many items, one commit), so it is not keyed to a single slug.
+			slug: 'terminal-question-drain',
+			arbiter,
+			kind: 'needs-attention',
+			onContended: 'drain stranded questions',
+			explicitMainRefspec: true,
+			env,
+			note,
+			// RE-PLANNED per attempt against the freshly-fetched base: the residue is
+			// RE-DERIVED from that base, never reused from the probe above, so an item
+			// re-opened out of its terminal folder, or a sidecar a human answered, in the
+			// contention window is correctly left alone.
+			plan: (base) => {
+				const fresh = deriveTerminalQuestionResidue(base, cwd, env);
+				applied = fresh.drainable;
+				result.answeredHeld = fresh.answeredHeld.map((r) => r.item);
+				return prepareTerminalQuestionDrainCommit({
+					cwd,
+					base,
+					residue: fresh.drainable,
+					env,
+				});
+			},
+		});
+	} catch (err) {
+		result.errors.push({
+			item: '(publish)',
+			message: err instanceof Error ? err.message : String(err),
+		});
+		return result;
+	}
+	if (!landed) {
+		result.errors.push({
+			item: '(publish)',
+			message:
+				'the stranded-question drain did not land on the arbiter’s main ' +
+				'(contention exhausted, or nothing to do); state left untouched.',
+		});
+		return result;
+	}
+	for (const r of applied) {
+		result.drained.push(r.item);
+		if (r.terminal === 'completed' && r.flagged) {
+			result.unflagged.push(r.item);
+		}
+	}
+	return result;
+}
+
+/**
+ * Build the ONE tree-less commit that removes every drainable sidecar and clears
+ * the `needsAnswers` flag on every `completed`-terminal body, using PLUMBING on a
+ * SCRATCH INDEX (the caller's index/HEAD/working tree are never touched)
+ * exactly as {@link prepareTreelessSurfaceCommit} does in the opposite direction.
+ *
+ * Batched into a single commit on purpose: the residue is a SET, one commit is
+ * one CAS against `main` instead of N, and the whole drain then lands or does not
+ * land atomically.
+ */
+function prepareTerminalQuestionDrainCommit(params: {
+	cwd: string;
+	base: string;
+	residue: TerminalQuestionResidue[];
+	env: NodeJS.ProcessEnv | undefined;
+}): TreelessAttemptPlan {
+	const {cwd, base, residue, env} = params;
+	// RE-DERIVE against THIS base: anything already gone is not our business.
+	const live = residue.filter((r) =>
+		pathInCommit(base, r.sidecarPath, cwd, env),
+	);
+	if (live.length === 0) {
+		return 'already-done';
+	}
+	const scratchIndex = join(
+		tmpdir(),
+		`dorfl-question-drain-${process.pid}-${Date.now()}.index`,
+	);
+	const withIndex: NodeJS.ProcessEnv = {
+		...(env ?? process.env),
+		GIT_INDEX_FILE: scratchIndex,
+	};
+	try {
+		gitHard(['read-tree', base], cwd, withIndex);
+		for (const r of live) {
+			// Remove the stale sidecar.
+			gitHard(
+				['update-index', '--force-remove', r.sidecarPath],
+				cwd,
+				withIndex,
+			);
+			// Clear the flag ONLY on a `completed` terminal (see the doc above).
+			if (r.terminal !== 'completed' || !r.flagged) {
+				continue;
+			}
+			if (!pathInCommit(base, r.itemPath, cwd, env)) {
+				continue;
+			}
+			const body = catBlob(`${base}:${r.itemPath}`, cwd, env);
+			const cleared = setNeedsAnswersMarker(body, false);
+			// Defense-in-depth, mirroring the surface path's guard: if the marker did
+			// not parse back as `false`, leave the body ALONE rather than write a
+			// body we cannot vouch for.
+			if (parseFrontmatter(cleared).needsAnswers !== false) {
+				continue;
+			}
+			const blob = hashObject(cleared, cwd, env);
+			gitHard(
+				[
+					'update-index',
+					'--add',
+					'--cacheinfo',
+					`100644,${blob},${r.itemPath}`,
+				],
+				cwd,
+				withIndex,
+			);
+		}
+		const tree = runHard(['write-tree'], cwd, withIndex).stdout.trim();
+		const subject =
+			live.length === 1
+				? `drain stranded question state for ${live[0].item} (terminal on main)`
+				: `drain stranded question state for ${live.length} terminal items`;
+		const commit = runHard(
+			['commit-tree', tree, '-p', base, '-m', subject],
+			cwd,
+			env,
+		).stdout.trim();
+		const ref = 'refs/dorfl/question-drain/batch';
 		gitHard(['update-ref', ref, commit], cwd, env);
 		return {ref, commit};
 	} finally {
