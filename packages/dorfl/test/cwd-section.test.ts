@@ -101,6 +101,58 @@ describe('resolveCwdSection — cwd participation', () => {
 	});
 });
 
+describe('resolveCwdSection: stranded question state is REPORTED, never cleared', () => {
+	/**
+	 * `status` is READ-ONLY: it must SURFACE a stranded `needsAnswers` gate on a
+	 * shipped item (so the residue is visible) while writing nothing. The gate can
+	 * outlive its sidecar, so the report must cover the flag-only shape too, not
+	 * just a stale sidecar.
+	 */
+	it('names a terminal item whose needsAnswers gate is armed with NO sidecar', async () => {
+		const {repo} = seedCwdRepo({'a.md': task('a')});
+		// A shipped task still carrying the gate, with no sidecar beside it.
+		const done = join(repo, 'work', 'tasks', 'done');
+		mkdirSync(done, {recursive: true});
+		writeFileSync(
+			join(done, 'shipped.md'),
+			task('shipped', {needsAnswers: 'true'}),
+		);
+		gitIn(['add', '-A'], repo);
+		gitIn(['commit', '-q', '-m', 'ship it'], repo);
+		gitIn(['push', '-q', 'arbiter', 'main:main'], repo);
+
+		const section = await resolveCwdSection({
+			cwd: repo,
+			config: config(),
+			lockArbiterRemote: 'arbiter',
+		});
+
+		expect(section.staleQuestions).toContain('task:shipped');
+		// READ-ONLY: the gate is still armed on `main` after a status read.
+		expect(
+			gitIn(['show', 'arbiter/main:work/tasks/done/shipped.md'], repo),
+		).toMatch(/needsAnswers: true/);
+		// And it is rendered for the human.
+		const out = formatCwdSection(section).join('\n');
+		expect(out).toMatch(/question state not yet cleared/);
+		expect(out).toMatch(/task:shipped/);
+	});
+
+	it('does NOT name a pool item that merely carries the gate', async () => {
+		// The legal pre-surface state: flagged, unsurfaced, resting in the pool.
+		const {repo} = seedCwdRepo({'a.md': task('a', {needsAnswers: 'true'})});
+		gitIn(['push', '-q', 'arbiter', 'main:main'], repo);
+
+		const section = await resolveCwdSection({
+			cwd: repo,
+			config: config(),
+			lockArbiterRemote: 'arbiter',
+		});
+
+		expect(section.staleQuestions ?? []).toEqual([]);
+	});
+});
+
 describe('resolveCwdSection — fetch-first + divergence (main-divergence-guard framing)', () => {
 	it('fetches the cwd arbiter first and reports a clean (in-sync) divergence', async () => {
 		const {repo} = seedCwdRepo({'a.md': task('a')});

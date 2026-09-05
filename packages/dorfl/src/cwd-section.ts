@@ -380,7 +380,13 @@ export async function resolveCwdSection(
 			mainRef: `${lockRemote}/main`,
 			env,
 		});
-		staleQuestions = residue.drainable.map((r) => r.item);
+		// BOTH halves of the residue are reported under one heading: a stale sidecar
+		// (with or without its flag) and an armed gate with no sidecar left are the
+		// same defect seen from either side, and both drain on the same pass.
+		staleQuestions = [
+			...residue.drainable.map((r) => r.item),
+			...residue.staleFlags.map((r) => r.item),
+		];
 		unappliedAnswers = residue.answeredHeld.map((r) => r.item);
 	} else if (hasLockRemote) {
 		// Under the explicit opt-in the question residue is DRAINED alongside the

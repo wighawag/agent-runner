@@ -2145,20 +2145,32 @@ export function prepareTreelessSurfaceCommit(params: {
 /**
  * The kind of TERMINAL resting place an item has reached on `main`, which
  * decides how much of its question state is residue.
- *   - `completed`, the work HAPPENED (`tasks/done/`, `specs/tasked/`). Any
- *     surviving question state is pure residue: the questions were about how to
- *     proceed, and the item proceeded.
+ *   - `completed`, the work HAPPENED (`tasks/done/`). Any surviving question
+ *     state is pure residue: the questions were about how to proceed, and the
+ *     item proceeded.
  *   - `wont-proceed`, the item was ABANDONED (`tasks/cancelled/`,
  *     `specs/dropped/`). Here `needsAnswers:true` may be ACCURATE HISTORY: an
  *     item can be cancelled precisely BECAUSE its questions were never answered,
  *     and the body may carry a real `## Open questions` section recording that.
+ *
+ * NOTE what is ABSENT: `specs/tasked/`. It is a terminal RESIDENCE, but this map
+ * is keyed to "is the question loop CLOSED here?", not "has the item stopped
+ * moving?", and on a tasked spec the loop is explicitly still open (see the
+ * `case 'spec'` comment below).
  */
 export type TerminalKind = 'completed' | 'wont-proceed';
 
-/** The terminal `work/` paths for an item, tagged by {@link TerminalKind}, so a
- * reader can tell "the work happened" from "the item was abandoned". Mirrors
- * `terminalMainPaths` in `item-lock.ts` (same folders, same per-regime split);
- * this variant carries the KIND the question-state drain branches on. */
+/**
+ * The terminal `work/` paths for an item, tagged by {@link TerminalKind}, so a
+ * reader can tell "the work happened" from "the item was abandoned".
+ *
+ * Same SHAPE as `terminalMainPaths` in `item-lock.ts`, but deliberately NOT the
+ * same folder set, and the difference must not be "tidied" away: locks treat
+ * `specs/tasked/` as terminal (correctly, a tasked spec must release its lock),
+ * whereas QUESTION state there is still live. This map is keyed to "is the
+ * question loop CLOSED at this resting place?", not "has the item stopped
+ * moving?". See the `case 'spec'` comment below.
+ */
 export function terminalMainPathsByKind(
 	type: SidecarType,
 	slug: string,
@@ -2171,15 +2183,81 @@ export function terminalMainPathsByKind(
 				{path: workItemRel('cancelled', file), kind: 'wont-proceed'},
 			];
 		case 'spec':
-			return [
-				{path: workItemRel('specs-tasked', file), kind: 'completed'},
-				{path: workItemRel('specs-dropped', file), kind: 'wont-proceed'},
-			];
+			// `specs/tasked/` is deliberately NOT listed. WORK-CONTRACT ("A SPEC that
+			// has drifted AFTER it was TASKED") makes a bare `needsAnswers:true` on a
+			// tasked spec LEGAL and load-bearing: it means "tasked, but the spec has
+			// drifted, do not RE-task or rely on it until reconciled", and the
+			// contract says to set it *while the spec stays in `specs/tasked/`*
+			// (moving it back would falsely un-record a tasking that really happened
+			// and orphan the tasks it already emitted).
+			//
+			// So the reasoning that makes a task's question state moot at its terminal
+			// does NOT transfer: a tasked spec is still IN the question loop.
+			// `lifecycle-gather.ts` enumerates tasked resting specs UNCONDITIONALLY,
+			// routing a bare flag to the SURFACE rung and an answered sidecar to the
+			// APPLY rung, so BOTH halves are live inputs to a rung that WILL run.
+			// Draining either would disarm a live drift gate and let a stale spec be
+			// re-tasked. That is precisely the "clearing a live needsAnswers hands gated work
+			// to agents" harm this pass exists to avoid.
+			//
+			// `specs/dropped/` needs no such carve-out: a dropped spec is abandoned,
+			// and no rung enumerates it.
+			return [{path: workItemRel('specs-dropped', file), kind: 'wont-proceed'}];
 		case 'observation':
 			// A note has no durable terminal folder: it leaves by DELETION, so there
 			// is no resting record to reconcile against.
 			return [];
 	}
+}
+
+/** Every SUCCESS-terminal folder that can hold a stranded `needsAnswers` flag,
+ * paired with the item type that rests there. Derived from
+ * {@link terminalMainPathsByKind} with a sentinel slug so the folder set stays
+ * SINGLE-SOURCED: adding a regime there adds it here, and the `wont-proceed`
+ * terminals are excluded by the SAME `kind` split the drain already branches on
+ * (a cancelled item's flag is accurate history, not residue). `observation`
+ * contributes nothing, having no durable terminal. */
+function successTerminalFolders(): {folder: string; type: SidecarType}[] {
+	const out: {folder: string; type: SidecarType}[] = [];
+	for (const type of ['task', 'spec', 'observation'] as const) {
+		for (const candidate of terminalMainPathsByKind(type, '__slug__')) {
+			if (candidate.kind !== 'completed') {
+				continue;
+			}
+			out.push({
+				folder: candidate.path.slice(0, candidate.path.lastIndexOf('/')),
+				type,
+			});
+		}
+	}
+	return out;
+}
+
+/**
+ * A SUCCESS-terminal item carrying a STRANDED `needsAnswers:true` flag with NO
+ * sidecar beside it: the residue's harmful half, on its own.
+ *
+ * This is NOT the mirror state the classifier calls legal. `needsAnswers:true`
+ * with no sidecar IS normal on a POOL or STAGING item (it is precisely the
+ * `surface` rung's input, and clearing it there would disarm every un-surfaced
+ * gated item in the repo). What makes THIS shape residue is the POSITION: the
+ * item has already SHIPPED, so there is no question left to surface and no
+ * answer that could still be typed, because `surface` will never run on it again.
+ *
+ * It is reached whenever the two halves are separated in the one order the
+ * sidecar-anchored sweep cannot follow: the SIDECAR goes first and the FLAG is
+ * left behind. A human tidying `work/questions/` by hand does exactly that (the
+ * obvious manual clean-up, and the sidecar is the visible half), which is how
+ * the fix
+ * for the paired residue can report success while any gate it cannot see stays
+ * armed. Anchoring only on the sidecar set makes hand-cleanup permanently strand
+ * the half that actually gates work.
+ */
+export interface TerminalFlagResidue {
+	/** The namespaced identity (`task:<slug>`). */
+	item: string;
+	/** The item body's SUCCESS-terminal path on `main`. */
+	itemPath: string;
 }
 
 /** One item whose question state survived into a terminal resting place. */
@@ -2212,6 +2290,12 @@ export interface TerminalQuestionReport {
 	 * silently deleted (the answer is data the tool did not author).
 	 */
 	answeredHeld: TerminalQuestionResidue[];
+	/**
+	 * SUCCESS-terminal items whose `needsAnswers` gate is armed with NO sidecar
+	 * beside it. Cleared by the drain (there is no sidecar, so nothing a human
+	 * wrote can be discarded). See {@link TerminalFlagResidue}.
+	 */
+	staleFlags: TerminalFlagResidue[];
 	errors: {item: string; message: string}[];
 }
 
@@ -2250,11 +2334,21 @@ export interface TerminalQuestionReport {
  * folder on `main`; an item resting in a pool or staging folder keeps whatever
  * state it has, untouched.
  *
- * The enumeration is anchored on the SIDECAR SET (`work/questions/` on `main`),
- * which is small, cheap to list, and is the half that makes the residue
- * discoverable unambiguously. A terminal item carrying a bare flag and no sidecar
- * is deliberately NOT swept: that shape is the legal one above, and there is no
- * second signal to distinguish residue from a hand-authored declaration.
+ * TWO ENUMERATIONS, because the two halves can be separated in either order and
+ * a sweep anchored on one is blind to the other:
+ *   1. the SIDECAR SET (`work/questions/` on `main`), small and cheap to list,
+ *      which finds a stale sidecar and the flag paired with it; and
+ *   2. the SUCCESS-TERMINAL BODIES that are flagged with NO sidecar beside them
+ *      ({@link collectStrandedTerminalFlags}), which finds the armed gate ALONE.
+ *
+ * (2) is not optional tidiness. It is the half that actually gates work, and a
+ * sweep anchored only on (1) reports success while any gate it cannot see stays
+ * armed. The sidecar is the
+ * half a human deletes by hand (it is the visible one, in a folder they scan),
+ * and deleting it REMOVES the only handle (1) has, stranding the flag for good.
+ * The discriminator that keeps (2) safe is POSITION, exactly as for (1): a bare
+ * flag is LEGAL on a pool/staging item (the `surface` rung's input) and residue
+ * only once the item has shipped, where `surface` can never run again.
  *
  * Best-effort and never throws.
  */
@@ -2304,8 +2398,16 @@ function deriveTerminalQuestionResidue(
 	const out: TerminalQuestionReport = {
 		drainable: [],
 		answeredHeld: [],
+		staleFlags: [],
 		errors: [],
 	};
+	// The SECOND half of the residue, enumerated from the OTHER side. The sidecar
+	// sweep below can only ever see items that still HAVE a sidecar; this one finds
+	// the SUCCESS-terminal bodies whose gate is armed with no sidecar left to point
+	// at them. Both must run: they are the same defect observed through the two
+	// halves the surface path writes atomically, and either half can outlive the
+	// other.
+	collectStrandedTerminalFlags(mainRef, cwd, env, out);
 	const questionsDir = workFolderRel('questions');
 	const ls = run(
 		'git',
@@ -2392,6 +2494,144 @@ function deriveTerminalQuestionResidue(
 	return out;
 }
 
+/**
+ * Find every SUCCESS-terminal body on `base` carrying `needsAnswers:true` with NO
+ * sidecar beside it, appending them to `out.staleFlags`.
+ *
+ * ENUMERATION COST is why this is a `git grep` and not a walk. The terminal
+ * folders are the repo's largest and most monotonically growing (this repo holds
+ * 404 done tasks), and this runs on the CLAIM path, so reading every terminal
+ * body per claim would be a real tax on a hot path. One `git grep -l` returns
+ * only the candidates, and the frontmatter parse runs over that short list.
+ *
+ * The pattern is ANCHORED to match the PARSER rather than the word.
+ * `parseFrontmatter` reads keys with `/^([A-Za-z0-9_.]+)\s*:\s*(.*)$/`, so a key
+ * it will honour is always at column 0; an unanchored needle instead matches
+ * every body that merely DISCUSSES the flag, which in `work/tasks/done/` here is
+ * 77 files against 18 anchored, and the truthy form narrows it to 1.
+ *
+ * The value part is matched LOOSELY on purpose (optional quote, any case),
+ * because `toBoolean` unquotes and lower-cases before comparing, so
+ * `needsAnswers: 'True'` is a real armed gate. A needle of `:\s*true` would read
+ * tighter and be WRONG: it would silently skip those bodies for ever, which is
+ * the blind-spot class this function exists to remove. A superset is the safe
+ * direction for a shortlist; a subset is not.
+ *
+ * The grep is still only a CANDIDATE FILTER, never the decision: prose can sit
+ * at column 0 too (`needsAnswers: true?` appears in this repo's own bodies), so
+ * every hit is confirmed by actually PARSING the frontmatter.
+ *
+ * Two git-isms are pinned rather than left to the environment:
+ *   - `core.quotePath=false`, or git C-quotes any non-ASCII path
+ *     (`"work/.../caf\303\251.md"`). A quoted line still starts with the
+ *     `<base>:` prefix but then fails the folder-prefix test, so such a body
+ *     would be SILENTLY skipped for ever, a permanent blind spot of exactly the
+ *     class this function exists to remove.
+ *   - `--full-name` + `:(top,literal)` pathspecs, because `git grep`'s pathspecs
+ *     are CWD-RELATIVE (unlike the `ls-tree`/`cat-file` probes elsewhere here,
+ *     which are tree-relative) and are globs. Without these, running any dorfl
+ *     command from a SUBDIRECTORY makes this half a silent no-op while the
+ *     sidecar half keeps working.
+ *
+ * Never throws; a failed grep yields no candidates, which leaves state alone.
+ */
+function collectStrandedTerminalFlags(
+	base: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv | undefined,
+	out: TerminalQuestionReport,
+): void {
+	const folders = successTerminalFolders();
+	if (folders.length === 0) {
+		return;
+	}
+	// `-l` names files only, `-I` skips binaries. Exit 1 means NO MATCH, which
+	// ALSO covers "the folder does not exist on this base yet" (verified: an
+	// absent pathspec folder exits 1 with no stderr), and an absent lifecycle
+	// folder is legal per WORK-CONTRACT rule 3. Any OTHER non-zero is a genuine
+	// fault and is REPORTED rather than swallowed: degrading silently to "no
+	// candidates" would leave this half a no-op while the sidecar half keeps
+	// reporting success, which is the very "reports success while the gate stays
+	// armed" shape this change exists to correct.
+	const grep = run(
+		'git',
+		[
+			'-c',
+			'core.quotePath=false',
+			'grep',
+			'-l',
+			'-I',
+			'--full-name',
+			'-E',
+			'^needsAnswers:[[:space:]]*[\'"]?[Tt][Rr][Uu][Ee]',
+			base,
+			'--',
+			...folders.map((f) => `:(top,literal)${f.folder}`),
+		],
+		cwd,
+		{env},
+	);
+	if (grep.status !== 0) {
+		if (grep.status !== 1) {
+			out.errors.push({
+				item: '(stranded-flag scan)',
+				message:
+					`git grep over the terminal folders failed (exit ${grep.status}): ` +
+					`${grep.stderr.trim() || 'no stderr'}; stranded gates were NOT scanned.`,
+			});
+		}
+		return;
+	}
+	const prefix = `${base}:`;
+	for (const line of grep.stdout.split('\n')) {
+		const raw = line.trim();
+		if (raw === '' || !raw.startsWith(prefix)) {
+			continue;
+		}
+		const path = raw.slice(prefix.length);
+		try {
+			const home = folders.find((f) => path.startsWith(`${f.folder}/`));
+			if (home === undefined) {
+				continue;
+			}
+			const name = path.slice(home.folder.length + 1);
+			// Direct children only: a nested path is not an item body.
+			if (name.includes('/') || !isWorkItemFile(name)) {
+				continue;
+			}
+			// Case-INSENSITIVE to match `isWorkItemFile` above: a `Foo.MD` body must
+			// yield the slug `Foo`, or the sidecar-existence guard below would probe
+			// the wrong path and could clear a gate whose sidecar holds an answer.
+			const slug = name.replace(/\.md$/i, '');
+			if (slug === '') {
+				continue;
+			}
+			const item = `${home.type}:${slug}`;
+			// A sidecar STILL EXISTS for this item (canonical or legacy alias) ⇒ this
+			// is the sidecar-anchored sweep's business, not ours. Skipping keeps the
+			// two enumerations DISJOINT, so an item is never planned twice in one
+			// commit and the answered-sidecar carve-out cannot be bypassed through
+			// this path (an item held for an unapplied human answer keeps its flag).
+			if (
+				sidecarPathCandidates(item).some((c) => pathInCommit(base, c, cwd, env))
+			) {
+				continue;
+			}
+			// CONFIRM against the parsed frontmatter: the grep only shortlisted.
+			const body = catBlob(`${base}:${path}`, cwd, env);
+			if (parseFrontmatter(body).needsAnswers !== true) {
+				continue;
+			}
+			out.staleFlags.push({item, itemPath: path});
+		} catch (err) {
+			out.errors.push({
+				item: path,
+				message: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+}
+
 /** What a {@link reconcileTerminalQuestionResidue} pass did. */
 export interface TerminalQuestionDrainResult {
 	/** Items whose sidecar was deleted. */
@@ -2409,19 +2649,28 @@ export interface TerminalQuestionDrainResult {
  * the SAME {@link runTreelessLedgerMove} core the surface path uses (same
  * contention-retry, same lease, same write seam; there is no second mechanism).
  *
- * WHAT IT CLEARS, and the deliberate asymmetry between the two terminals:
- *   - the SIDECAR is deleted for EITHER terminal. A question asking whether to
- *     cancel an item that has already come to rest is stale in both cases, and it
- *     sits in a folder a human scans carrying a destructive default.
+ * WHAT IT CLEARS, and the deliberate asymmetry between the two terminals. Note
+ * the terminal SET first: `specs/tasked/` is deliberately NOT in this map at all
+ * (see {@link terminalMainPathsByKind}), so nothing below applies to a tasked
+ * spec, whose question state stays untouched in both halves.
+ *   - the SIDECAR is deleted for EITHER terminal in the map. A question asking
+ *     whether to cancel an item that has already come to rest is stale in both
+ *     cases, and it sits in a folder a human scans carrying a destructive
+ *     default.
  *   - the `needsAnswers` FLAG is cleared ONLY for a `completed` terminal
- *     (`tasks/done/`, `specs/tasked/`). On a `wont-proceed` terminal
+ *     (`tasks/done/`). On a `wont-proceed` terminal
  *     (`tasks/cancelled/`, `specs/dropped/`) the flag is KEPT, because an item
  *     can be cancelled precisely BECAUSE its questions were never answered: there
  *     the flag is accurate history, not residue, and the body may carry a real
  *     `## Open questions` section saying so. Keeping it is harmless, a terminal
  *     item is in no pool, so the flag gates nothing.
+ *   - a SUCCESS-terminal item whose gate is armed with NO sidecar left beside it
+ *     has that FLAG cleared and nothing deleted (there is nothing to delete).
+ *     Restricted to the `completed` terminal by the same asymmetry above.
  *
- * A sidecar with ANY answered entry is never touched (see the classifier).
+ * A sidecar with ANY answered entry is never touched (see the classifier), and
+ * an item still holding such a sidecar is excluded from the flag-only half too,
+ * so the carve-out cannot be bypassed by clearing its gate.
  *
  * Best-effort: it never throws, and any fault leaves the state exactly as it was.
  */
@@ -2461,7 +2710,7 @@ export async function reconcileTerminalQuestionResidue(params: {
 	}
 	result.answeredHeld = report.answeredHeld.map((r) => r.item);
 	result.errors.push(...report.errors);
-	if (report.drainable.length === 0) {
+	if (report.drainable.length === 0 && report.staleFlags.length === 0) {
 		return result;
 	}
 	// What the LANDED commit ACTUALLY did, filled in by the plan against the base
@@ -2469,6 +2718,10 @@ export async function reconcileTerminalQuestionResidue(params: {
 	// anything to do?" probe; reporting from it would claim a gate was disarmed
 	// when a contention retry re-derived the residue and skipped the item.
 	let applied: TerminalQuestionResidue[] = [];
+	// Filled by the PLAN with what it actually STAGED (not what it intended), so a
+	// body the marker writer cannot annotate is never reported as unflagged.
+	const clearedSidecarFlags: TerminalQuestionResidue[] = [];
+	const clearedStaleFlags: TerminalFlagResidue[] = [];
 	// NEVER THROW. `runTreelessLedgerMove` and the git plumbing inside the plan
 	// both throw on any non-zero git, and this pass runs from the CLAIM path as
 	// OPPORTUNISTIC HYGIENE on unrelated items. A fault here (a stale scratch ref,
@@ -2499,6 +2752,9 @@ export async function reconcileTerminalQuestionResidue(params: {
 					cwd,
 					base,
 					residue: fresh.drainable,
+					staleFlags: fresh.staleFlags,
+					clearedSidecarFlags,
+					clearedStaleFlags,
 					env,
 				});
 			},
@@ -2521,11 +2777,56 @@ export async function reconcileTerminalQuestionResidue(params: {
 	}
 	for (const r of applied) {
 		result.drained.push(r.item);
-		if (r.terminal === 'completed' && r.flagged) {
-			result.unflagged.push(r.item);
-		}
+	}
+	// `unflagged` reports what the commit ACTUALLY staged, from both halves. The
+	// flag-only half never appears in `drained`: it deletes nothing.
+	for (const r of [...clearedSidecarFlags, ...clearedStaleFlags]) {
+		result.unflagged.push(r.item);
 	}
 	return result;
+}
+
+/**
+ * Stage `itemPath` with `needsAnswers` cleared, into the scratch index the drain
+ * commit is being built in. Shared by BOTH halves of the residue (the
+ * sidecar-paired flag and the stranded flag-only one) so they can never disagree
+ * about what clearing a gate means.
+ *
+ * Defense-in-depth, mirroring the surface path's guard in the opposite
+ * direction: if the marker does not parse back as `false`, the body is left
+ * ALONE rather than written as something we cannot vouch for. Every uncertainty
+ * resolves to LEAVING STATE ALONE.
+ *
+ * RETURNS whether the gate was actually STAGED, so callers report EFFECT rather
+ * than INTENT. That distinction is load-bearing here: a body this cannot
+ * annotate (e.g. duplicate `needsAnswers` keys, where the writer replaces the
+ * FIRST and the parser reads the LAST) would otherwise be reported as unflagged
+ * on every claim for ever while its gate stayed armed, the precise
+ * "reports success while the defect remains" failure this whole change exists to
+ * correct.
+ */
+function clearNeedsAnswersInIndex(
+	itemPath: string,
+	base: string,
+	cwd: string,
+	env: NodeJS.ProcessEnv | undefined,
+	withIndex: NodeJS.ProcessEnv,
+): boolean {
+	if (!pathInCommit(base, itemPath, cwd, env)) {
+		return false;
+	}
+	const body = catBlob(`${base}:${itemPath}`, cwd, env);
+	const cleared = setNeedsAnswersMarker(body, false);
+	if (parseFrontmatter(cleared).needsAnswers !== false) {
+		return false;
+	}
+	const blob = hashObject(cleared, cwd, env);
+	gitHard(
+		['update-index', '--add', '--cacheinfo', `100644,${blob},${itemPath}`],
+		cwd,
+		withIndex,
+	);
+	return true;
 }
 
 /**
@@ -2542,14 +2843,29 @@ function prepareTerminalQuestionDrainCommit(params: {
 	cwd: string;
 	base: string;
 	residue: TerminalQuestionResidue[];
+	staleFlags: TerminalFlagResidue[];
+	/**
+	 * OUT-PARAM: filled with the items whose gate was ACTUALLY staged as cleared,
+	 * so the caller reports EFFECT rather than intent. Cleared on entry, because a
+	 * contention retry re-plans against a fresh base and the previous attempt's
+	 * result must not leak into the report.
+	 */
+	clearedSidecarFlags: TerminalQuestionResidue[];
+	clearedStaleFlags: TerminalFlagResidue[];
 	env: NodeJS.ProcessEnv | undefined;
 }): TreelessAttemptPlan {
-	const {cwd, base, residue, env} = params;
+	const {cwd, base, residue, env, clearedSidecarFlags, clearedStaleFlags} =
+		params;
+	clearedSidecarFlags.length = 0;
+	clearedStaleFlags.length = 0;
 	// RE-DERIVE against THIS base: anything already gone is not our business.
 	const live = residue.filter((r) =>
 		pathInCommit(base, r.sidecarPath, cwd, env),
 	);
-	if (live.length === 0) {
+	const liveFlags = params.staleFlags.filter((r) =>
+		pathInCommit(base, r.itemPath, cwd, env),
+	);
+	if (live.length === 0 && liveFlags.length === 0) {
 		return 'already-done';
 	}
 	const scratchIndex = join(
@@ -2573,34 +2889,27 @@ function prepareTerminalQuestionDrainCommit(params: {
 			if (r.terminal !== 'completed' || !r.flagged) {
 				continue;
 			}
-			if (!pathInCommit(base, r.itemPath, cwd, env)) {
-				continue;
+			if (clearNeedsAnswersInIndex(r.itemPath, base, cwd, env, withIndex)) {
+				clearedSidecarFlags.push(r);
 			}
-			const body = catBlob(`${base}:${r.itemPath}`, cwd, env);
-			const cleared = setNeedsAnswersMarker(body, false);
-			// Defense-in-depth, mirroring the surface path's guard: if the marker did
-			// not parse back as `false`, leave the body ALONE rather than write a
-			// body we cannot vouch for.
-			if (parseFrontmatter(cleared).needsAnswers !== false) {
-				continue;
+		}
+		// The FLAG-ONLY half: a SUCCESS terminal whose sidecar is already gone. No
+		// `--force-remove` here, because there is nothing to delete; the armed gate IS the
+		// whole residue.
+		// Record what was actually STAGED: a body we could not annotate is dropped
+		// from the report rather than claimed as cleared.
+		for (const r of liveFlags) {
+			if (clearNeedsAnswersInIndex(r.itemPath, base, cwd, env, withIndex)) {
+				clearedStaleFlags.push(r);
 			}
-			const blob = hashObject(cleared, cwd, env);
-			gitHard(
-				[
-					'update-index',
-					'--add',
-					'--cacheinfo',
-					`100644,${blob},${r.itemPath}`,
-				],
-				cwd,
-				withIndex,
-			);
 		}
 		const tree = runHard(['write-tree'], cwd, withIndex).stdout.trim();
+		const touched = live.length + liveFlags.length;
+		const only = live[0]?.item ?? liveFlags[0]?.item;
 		const subject =
-			live.length === 1
-				? `drain stranded question state for ${live[0].item} (terminal on main)`
-				: `drain stranded question state for ${live.length} terminal items`;
+			touched === 1
+				? `drain stranded question state for ${only} (terminal on main)`
+				: `drain stranded question state for ${touched} terminal items`;
 		const commit = runHard(
 			['commit-tree', tree, '-p', base, '-m', subject],
 			cwd,
