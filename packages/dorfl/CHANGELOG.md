@@ -1,5 +1,55 @@
 # dorfl
 
+## 0.13.3
+
+### Patch Changes
+
+- c814e57: Release a propose-mode per-item lock once its item is terminal on `main`, so completed, merged work stops reporting as in-progress for ever.
+
+  `complete --propose` deliberately keeps the lock held after opening the PR, and says so: `keeping the per-item lock HELD (propose PR open; the work is not yet on main). It is released when the PR merges (reconciled against main).` Holding it is right, because the done-move is on the PR branch and `main` still shows the body in the ready pool, so releasing there would let the next tick re-claim an item under review. The second sentence, however, never happened. Nobody runs a dorfl process at the moment a human clicks merge on GitHub, there is no merge hook and no daemon, so a release scheduled for merge-time could never fire. `reconcileItemLockAgainstMain` had implemented exactly the right decision since the lock cutover, but had no caller on any ordinary path: it was reachable only from the opt-in `gc --ledger --reap-stale-locks` sweep, which an operator driving `do`/`complete` by hand never runs. Every propose build therefore leaked its lock ref permanently. On one arbiter this reached 26 refs, every one naming a task at rest in `work/tasks/done/`, all listed by `status` under "In progress (lock held)". The `--merge` path never showed this because it lands on `main` inline and releases in-process.
+
+  The bug has two halves and they are fixed in two different places.
+
+  The **mis-reporting** half is fixed in the read commands. `status` and `scan` now classify each held lock against the arbiter's `main` and report one whose item is already at rest as "Completed, lock not yet released", excluded from the in-flight list, so finished work no longer reads as in-progress. This classification writes nothing: **`status` and `scan` remain strictly read-only**, as their own descriptions promise.
+
+  The **leaked-ref** half is fixed on the **claim path**, which already writes to the arbiter, already fetches `main`, and runs on every unit of work. The stale terminal locks are released there, so the leaked set drains continuously as a side effect of ordinary use, with no human ever routed to a clean-up verb. That routing failure is the whole reason the leak grew to 26: `gc --ledger` had been reporting these very locks and printing the `release-lock` command all along.
+
+  `status --reconcile-locks` and `scan --reconcile-locks` run the same sweep on demand, for draining an existing backlog of refs immediately. They are a convenience, not the mechanism.
+
+  What a lock means is unchanged. The terminal test is the item's position on `<arbiter>/main` and nothing else: a task resting in `tasks/done/` or `tasks/cancelled/`, a spec in `specs/tasked/` or `specs/dropped/`. Never a branch, never a PR's existence or merge status, never the holder, never age. An item on an open PR still shows its body in the pool on `main`, so it keeps its lock, as does a genuinely stuck one; releasing a non-terminal lock would let two claimants build the same item, which is a much worse failure than the leak. Every uncertainty (unreadable `main`, an unclassifiable pre-cutover entry, any fault) resolves to keep, and `--reconcile-locks` authorises the sweep without widening that predicate by one inch. Only the terminal class is swept: the crash-window orphan (non-terminal but surfaced with `needsAnswers:true` plus a sidecar) remains the business of `gc --ledger --reap-stale-locks`.
+
+  Every delete is the same `--force-with-lease` delete `release-lock` and `requeue` already use, so a lock a concurrent writer moved is reported rather than stolen, never force-deleted. The sweep never throws and never fails a claim, which is unrelated work: it is opportunistic hygiene, not a precondition. It is idempotent. The recovery verbs are untouched: `requeue`, `requeue --reset`, `release-lock` and `release-lock --entry <literal>` keep their exact semantics, and a pre-cutover entry with no derivable item-form is left held for the `--entry` escape hatch.
+
+  Reading the arbiter's `main` is ref-shape dependent, and getting it wrong fails silently, so it is handled explicitly. A working clone holds the arbiter's main at `refs/remotes/<arbiter>/main`; a bare hub mirror (what the registry stores) has no `refs/remotes/*` namespace at all and holds it at `refs/heads/main`. Probing the wrong ref fails with `invalid object name`, which is indistinguishable from "not terminal", so every lock would classify as in-flight and the whole sweep would become a permanent no-op on the registry surface. The refresh therefore uses an explicit refspec that writes exactly the ref the probe reads, and the classifier verifies that ref resolves before probing, reporting an error rather than quietly answering "nothing is terminal". Regression tests cover both repo shapes.
+
+  `complete --propose`'s own message is corrected too. It used to promise "It is released when the PR merges (reconciled against main)", the sentence that was never true; it now says the item comes to rest on main when the PR merges and the lock is released by the next claim, naming a trigger that actually fires.
+
+  The design decision, including why the automatic release belongs on a write path rather than on `status`, is recorded in `docs/adr/terminal-state-reconciled-by-claim-not-by-read-commands.md`.
+
+  Verified against the live 26-ref corpus, cloned into a throwaway sandbox so the real arbiter was never written to. In both repo shapes, a working clone and a bare mirror, the read-only classifier identifies all 26 as terminal, zero in flight, zero errors, and leaves all 26 refs in place; the sweep then releases all 26 with zero kept and zero errors, and a second pass is a clean no-op.
+
+  ***
+
+  The same change also clears the STRANDED QUESTION STATE a bounced-then-rebuilt item leaves behind, because it is the same defect wearing a second hat and is settled by the same pass at the same moment.
+
+  When a build bounces, the surface path atomically writes both halves of the item's question state in one commit: the sidecar `work/questions/<type>-<slug>.md`, and `needsAnswers: true` on the item body. That is correct, and its atomicity is what makes reconciliation decidable at all. But if the human disagrees with the agent, re-dispatches, and the rebuild SUCCEEDS (PR opened, gate green, merged, body done-moved), neither half is ever cleared. Items come to rest in `tasks/done/` still carrying a question asking whether to CANCEL them, with a destructive default. The flag is the worse half: it is a gate left armed over shipped work, and it makes `status` report finished (sometimes released) work under "open questions block autonomous work".
+
+  Dorfl already knew this state was illegal. `advance-classify.ts` refuses it as `invariant-violation` with the tag `sidecar-without-needsAnswers`. The detector simply lived in the `advance` tick's classifier, and a human driving `do` and merging a PR never enters that loop. Both defects share a cause (cleared by a step that only runs on a path the item did not take), a moment (the done-move landing on `main`), and a blind spot (detectable only from a loop the manual path never enters), so there is ONE reconciliation, `reconcileTerminalState`, not two mechanisms. The classifier keeps its `invariant-violation` kind and both reason tags: reconciliation now prevents the state arising, and the classifier remains the backstop.
+
+  The drain publishes ONE tree-less commit to the arbiter's `main` through the same contention-retry and CAS-publish core the surface path uses, so there is no second write mechanism, and the batch lands or does not land atomically.
+
+  The trap this had to avoid is that the MIRROR state is legal and common: `needsAnswers: true` with no sidecar is exactly what an item authored with open questions looks like before `surface` runs, and that flagged-but-unsurfaced item is the `surface` rung's own input. Reconciling "flag without sidecar" would silently disarm every un-surfaced item in the repo and hand gated work to agents. So the terminal POSITION is the discriminator, never the flag/sidecar disagreement on its own; the enumeration is anchored on the sidecar set rather than on flags; and an item resting in a pool or staging folder keeps whatever state it has. Two negative regression tests pin this, and a simulated careless fix (treating a pool item as terminal) makes one of them fail.
+
+  Two asymmetries are deliberate. A `cancelled`/`dropped` item has its stale sidecar removed but KEEPS `needsAnswers: true`, because an item can be cancelled precisely because its questions were never answered, so there the flag is accurate history rather than residue; it gates nothing, since a terminal item is in no pool. And a sidecar carrying any ANSWERED entry is never auto-drained: in the field one had been answered in writing, ending "Close this sidecar", and was still sitting there, which is evidence the drain does not run on the human-answer path either. That is a separate defect, and this pass refuses to paper over it by destroying the evidence, so such an item is left untouched and reported instead.
+
+  `status` reports both halves of the residue read-only, under "Completed, question state not yet cleared" and "Answered but never applied".
+
+  The question drain is strictly opportunistic on the claim path. It is guarded so that no fault in it can fail the operator's actual work: a review found that a pre-existing loose ref at `refs/dorfl/question-drain` makes the batch scratch ref un-creatable, and the git plumbing threw out of the claim path, surfacing as exit 1 with no lock taken. That is now caught at two levels and reported, and a regression test pins the claim still succeeding. A protected `main` degrades the same way: the drain cannot land, so it reports and leaves the residue exactly as it was.
+
+  The residue is RE-DERIVED against the base each contention attempt commits on, rather than being carried over from the initial probe. Without that, two documented guarantees could be broken in the retry window: an item re-opened out of its terminal folder could have its now-live sidecar deleted, and a sidecar a human answered in the window could be deleted despite the answered carve-out. The reported result is likewise taken from what the landed commit actually did, so the pass can no longer claim a gate was disarmed when a retry skipped the item.
+
+  One narrow mid-migration case is deliberately skipped: a spec with BOTH `spec-<slug>.md` and the legacy `prd-<slug>.md` on `main` is left entirely to `dorfl prd-to-spec`, because draining only the canonical name while clearing the flag would leave the legacy sidecar live against `needsAnswers: false`, which is exactly the invariant violation this change exists to remove.
+
 ## 0.13.2
 
 ### Patch Changes
