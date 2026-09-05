@@ -273,13 +273,25 @@ export function setFrontmatterMarker(
 	key: string,
 	value: string,
 ): string {
-	const normalized = content.replace(/\r\n/g, '\n');
+	// A leading BOM is legal, and the READER ({@link extractBlock}) strips one
+	// before looking for the fence. This WRITER must strip it the same way or the
+	// two disagree about whether the document HAS frontmatter: a BOM'd doc would
+	// fail the `startsWith('---\n')` test below, be judged FENCE-LESS, and get a
+	// SECOND fence prepended, demoting the real frontmatter into the body and
+	// silently destroying `slug`, `title`, `spec` and `blockedBy`. The corruption
+	// is invisible to every defense-in-depth guard that re-parses the result,
+	// because the marker itself parses back correctly.
+	//
+	// The BOM is the document's encoding marker, not ours to drop, so it is
+	// stripped only for the ANALYSIS and re-prepended to whatever we return.
+	const bom = content.startsWith('\uFEFF') ? '\uFEFF' : '';
+	const normalized = content.slice(bom.length).replace(/\r\n/g, '\n');
 	if (!normalized.startsWith('---\n')) {
 		// Fence-less document: PREPEND a minimal fence carrying just this marker,
 		// preserving the body verbatim (no leading blank between fence and body is
 		// collapsed — exactly one blank line separates the fence from the content).
 		const body = normalized.replace(/^\n+/, '');
-		return `---\n${key}: ${value}\n---\n\n${body}`;
+		return `${bom}---\n${key}: ${value}\n---\n\n${body}`;
 	}
 	const lines = normalized.split('\n');
 	const closing = lines.indexOf('---', 1);
@@ -292,11 +304,11 @@ export function setFrontmatterMarker(
 	for (let i = 1; i < closing; i++) {
 		if (pattern.test(lines[i])) {
 			lines[i] = `${key}: ${value}`;
-			return lines.join('\n');
+			return bom + lines.join('\n');
 		}
 	}
 	lines.splice(closing, 0, `${key}: ${value}`);
-	return lines.join('\n');
+	return bom + lines.join('\n');
 }
 
 /**

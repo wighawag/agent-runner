@@ -486,6 +486,56 @@ describe('setFrontmatterMarker', () => {
 		const md = '---\nslug: foo\nno closing fence here\n';
 		expect(setFrontmatterMarker(md, 'needsAnswers', 'true')).toBe(md);
 	});
+
+	/**
+	 * A BOM-prefixed doc used to be DEMOTED, not annotated. `extractBlock` (the
+	 * READER) strips a leading BOM, so `parseFrontmatter` sees the fence and
+	 * reports `slug`/`title` happily; this WRITER did not, so it judged the doc
+	 * fence-less and PREPENDED a second fence, pushing the real frontmatter down
+	 * into the body. The marker then parsed back correctly, so every
+	 * defense-in-depth guard that re-parses the result (the surface path's, and
+	 * the terminal drain's) was satisfied and the corrupted body was committed,
+	 * silently losing `slug`, `title`, `spec` and `blockedBy`.
+	 *
+	 * A BOM is rare in this tree but entirely legal, and it is exactly the input a
+	 * Windows editor or an external tool produces.
+	 */
+	describe('a BOM-prefixed document (reader strips it, so the writer must too)', () => {
+		const bom = '\uFEFF';
+		const md = `${bom}---\ntitle: t\nslug: foo\nneedsAnswers: true\n---\n\nbody\n`;
+
+		it('REPLACES the key in the real fence instead of prepending a second one', () => {
+			const out = setFrontmatterMarker(md, 'needsAnswers', 'false');
+			expect(parseFrontmatter(out).needsAnswers).toBe(false);
+			// Exactly one fence pair, and one needsAnswers line: not demoted. The
+			// opening fence carries the preserved BOM, hence the optional prefix.
+			expect(out.match(/^\uFEFF?---$/gm)).toHaveLength(2);
+			expect(out.match(/needsAnswers/g)).toHaveLength(1);
+			expect(out).toBe(
+				'\uFEFF---\ntitle: t\nslug: foo\nneedsAnswers: false\n---\n\nbody\n',
+			);
+		});
+
+		it('PRESERVES the sibling keys the demotion used to destroy', () => {
+			const out = setFrontmatterMarker(md, 'needsAnswers', 'false');
+			expect(parseFrontmatter(out).slug).toBe('foo');
+			expect(parseFrontmatter(md).slug).toBe('foo');
+		});
+
+		it('KEEPS the BOM (it is the document’s encoding marker, not ours to drop)', () => {
+			expect(setFrontmatterMarker(md, 'needsAnswers', 'false')).toMatch(
+				/^\uFEFF/,
+			);
+		});
+
+		it('still PREPENDS a fence to a BOM-prefixed FENCE-LESS document', () => {
+			const prose = `${bom}# heading\n\nprose\n`;
+			const out = setFrontmatterMarker(prose, 'needsAnswers', 'true');
+			expect(parseFrontmatter(out).needsAnswers).toBe(true);
+			expect(out).toMatch(/^\uFEFF---\n/);
+			expect(out).toContain('# heading');
+		});
+	});
 });
 
 describe('parseFrontmatter — the SHIPPED templates parse coherently (parser ⟷ template drift guard)', () => {
